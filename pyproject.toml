@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mem0-mcp-selfhosted"
-version = "0.5.0"
+version = "0.0.0"
 description = "Self-hosted mem0 MCP server for Claude Code"
 license = "MIT"
 requires-python = ">=3.10"
@@ -25,20 +25,23 @@ mem0-hook-context = "mem0_mcp_selfhosted.hooks:context_main"
 mem0-hook-stop = "mem0_mcp_selfhosted.hooks:stop_main"
 mem0-install-hooks = "mem0_mcp_selfhosted.hooks:install_main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/mem0_mcp_selfhosted"]
-
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
 
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mem0_mcp_selfhosted"]
+
+
 [tool.pytest.ini_options]
 markers = [
     "integration: tests that require live infrastructure (Qdrant, Ollama, Anthropic, Neo4j)",
     "contract: tests that validate mem0ai internal API stability",
 ]
+
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]
