@@ -167,6 +167,21 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
                 "device": env("MEM0_RERANK_DEVICE", "cpu"),
             },
         }
+        # MEM0_RERANK_MAX_LENGTH caps tokens/pair on the cross-encoder — a lower cap
+        # (e.g. 256) sharply cuts CPU rerank latency on long docs with no measured
+        # quality loss. Native DeepMem0 config field (replaces the old sitecustomize
+        # Patch 9 monkey-patch). GUARDED on the fork: stock mem0ai's reranker config
+        # has no max_length; an emergency rollback to mem0ai 2.0.7 simply forgoes the
+        # truncation (slower rerank) instead of erroring on an unknown field.
+        _rr_maxlen = opt_env("MEM0_RERANK_MAX_LENGTH")
+        if _rr_maxlen:
+            try:
+                import mem0 as _m0
+
+                if getattr(_m0, "__deepmem0__", False):
+                    config_dict["reranker"]["config"]["max_length"] = int(_rr_maxlen)
+            except Exception:
+                pass
 
     # --- Memory dynamics / ACT-R (DeepMem0 v0.2) ---
     # Sem env nenhuma, valem os defaults do fork (enabled, weight 0.15, janela
