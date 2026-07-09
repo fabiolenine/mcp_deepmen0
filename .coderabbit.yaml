@@ -1,0 +1,5 @@
+reviews:
+  path_filters:
+    - "!openspec/**"
+    - "!.claude/**"
+    - "!docs/**"

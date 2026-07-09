@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mem0-mcp-selfhosted"
+version = "0.5.0"
+description = "Self-hosted mem0 MCP server for Claude Code"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "elvismdev" },
+]
+dependencies = [
+    "mcp[cli]>=1.23.0",
+    "mem0ai[graph,llms]>=1.0.3",
+    "anthropic>=0.77.0",
+    "neo4j>=5.23.1",
+    "python-dotenv>=1.2.1",
+]
+
+[project.scripts]
+mem0-mcp-selfhosted = "mem0_mcp_selfhosted:main"
+mem0-hook-context = "mem0_mcp_selfhosted.hooks:context_main"
+mem0-hook-stop = "mem0_mcp_selfhosted.hooks:stop_main"
+mem0-install-hooks = "mem0_mcp_selfhosted.hooks:install_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mem0_mcp_selfhosted"]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: tests that require live infrastructure (Qdrant, Ollama, Anthropic, Neo4j)",
+    "contract: tests that validate mem0ai internal API stability",
+]
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+version_variables = ["src/mem0_mcp_selfhosted/__init__.py:__version__"]
+branches.main = { match = "main", prerelease = false }
+tag_format = "v{version}"
+commit_parser = "angular"
+commit_message = "chore(release): v{version} [skip ci]"
+upload_to_pypi = false
+upload_to_repository = false
+
+[tool.semantic_release.commit_parser_options]
+patch_tags = ["fix", "perf"]
+minor_tags = ["feat"]
+allowed_tags = [
+    "build", "chore", "ci", "docs", "feat", "fix",
+    "perf", "refactor", "style", "test",
+]
+
+[tool.semantic_release.changelog]
+changelog_file = "CHANGELOG.md"
+exclude_commit_patterns = [
+    "^chore\\(release\\):",
+    "^Merge ",
+]
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = true
+
+[tool.semantic_release.remote]
+type = "github"
+token = { env = "GH_TOKEN" }

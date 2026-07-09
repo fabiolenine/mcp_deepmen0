@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# pytest
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Credentials
+.credentials.json
+
+# MCP config (contains personal IPs, API keys)
+.mcp.json
+
+# Benchmark output
+benchmarks/*results*.json
+
+# Local development tooling
+.claude/
+openspec/
+docs/
