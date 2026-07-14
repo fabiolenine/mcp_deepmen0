@@ -308,8 +308,11 @@ class IngestWorker:
         # multi-chunk document jobs). With no prior points this is a cheap no-op.
         _purge_task_points(mem, task_id, created_at=job.get("submitted_at"))
 
-        if job.get("kind", "conversation") == "document":
+        kind = job.get("kind", "conversation")
+        if kind == "document":
             self._process_document(mem, job, t0)
+        elif kind == "update":
+            self._process_update(mem, job, t0)
         else:
             self._process_conversation(mem, job, t0)
 
@@ -376,6 +379,53 @@ class IngestWorker:
         _observe({
             "event": "ingest_done", "task_id": task_id, "duration_ms": duration_ms,
             "memory_count": len(memory_ids), "queue_depth": _safe_depth(self.queue),
+        })
+
+    # -- update jobs (async update_memory) --------------------------------
+
+    def _process_update(self, mem: Any, job: dict[str, Any], t0: float) -> None:
+        """Apply an async ``update_memory`` job: re-embed + re-index the memory and
+        (via the classifier patch) re-classify its metadata — the slow llama3.1:8b call
+        that used to time out synchronous callers now runs here in the background.
+
+        The target keeps its ORIGINAL created_at (mem0's update preserves it), so the
+        unconditional purge-on-retry (which matches created_at == submitted_at) spares
+        it, and a retry simply re-applies the same text idempotently.
+        """
+        task_id = job["task_id"]
+        params = job.get("params") or {}
+        memory_id = params.get("memory_id")
+        text = params.get("text")
+        if not memory_id or text is None:
+            self._fail(job, ValueError("update job missing memory_id/text in params"), t0)
+            return
+
+        # task_id is provenance only; do NOT stamp created_at (see docstring).
+        def _do_update():
+            return mem.update(memory_id, data=text, metadata={"task_id": task_id})
+
+        try:
+            if self.call_with_graph is not None:
+                # graph OFF for updates (like documents): the base update already
+                # re-links entities; no Neo4j toggle needed.
+                raw = self.call_with_graph(mem, False, self.enable_graph_default, _do_update)
+            else:
+                raw = _do_update()
+        except Exception as e:
+            self._fail(job, e, t0)
+            return
+
+        result = {
+            "memory_ids": [memory_id],
+            "events": [{"id": memory_id, "event": "UPDATE"}],
+            "processed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.queue.mark_done(task_id, result)
+        duration_ms = int((time.monotonic() - t0) * 1000)
+        logger.info("Update job %s done in %dms (memory_id=%s)", task_id, duration_ms, memory_id)
+        _observe({
+            "event": "ingest_done", "task_id": task_id, "kind": "update",
+            "duration_ms": duration_ms, "memory_count": 1, "queue_depth": _safe_depth(self.queue),
         })
 
     # -- document jobs (v0.5a) ---------------------------------------------

@@ -197,12 +197,45 @@ class TestGetMemory:
 
 class TestUpdateMemory:
     def test_uses_data_param(self, server_with_mock):
+        # conftest forces MEM0_ASYNC_INGEST=false -> synchronous fallback path.
         srv, mem = server_with_mock
         fn = _get_tool_fn(srv, "update_memory")
         result = fn(memory_id="uuid-123", text="updated fact")
         mem.update.assert_called_once_with("uuid-123", data="updated fact")
         parsed = json.loads(result)
         assert parsed["message"] == "Memory updated successfully!"
+
+    def test_async_returns_queued_envelope(self, server_with_mock, monkeypatch):
+        monkeypatch.setenv("MEM0_ASYNC_INGEST", "true")
+        srv, mem = server_with_mock
+        mem.get.return_value = {"id": "uuid-123", "memory": "old", "user_id": "alice"}
+        fn = _get_tool_fn(srv, "update_memory")
+        result = json.loads(fn(memory_id="uuid-123", text="new text"))
+        assert result["status"] == "queued"
+        assert result["task_id"].startswith("tsk_")
+        assert "estimated_wait_s" in result
+        mem.get.assert_called_once_with("uuid-123")
+        mem.update.assert_not_called()  # deferred to the worker, not applied inline
+
+    def test_async_memory_not_found_errors_without_enqueue(self, server_with_mock, monkeypatch):
+        monkeypatch.setenv("MEM0_ASYNC_INGEST", "true")
+        srv, mem = server_with_mock
+        mem.get.return_value = None
+        fn = _get_tool_fn(srv, "update_memory")
+        result = json.loads(fn(memory_id="ghost", text="x"))
+        assert result["error"] == "memory not found"
+        assert result["memory_id"] == "ghost"
+        mem.update.assert_not_called()
+
+    def test_async_identical_resubmit_returns_same_task(self, server_with_mock, monkeypatch):
+        monkeypatch.setenv("MEM0_ASYNC_INGEST", "true")
+        srv, mem = server_with_mock
+        mem.get.return_value = {"id": "uuid-123", "user_id": "alice"}
+        fn = _get_tool_fn(srv, "update_memory")
+        first = json.loads(fn(memory_id="uuid-123", text="same"))
+        second = json.loads(fn(memory_id="uuid-123", text="same"))
+        assert first["task_id"] == second["task_id"]
+        assert second.get("duplicate") is True
 
 
 class TestDeleteMemory:

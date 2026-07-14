@@ -102,11 +102,13 @@ def _estimate_wait_s(queue: IngestQueue) -> int:
     of magnitude once a document is in line."""
     est_add = int(env("MEM0_QUEUE_EST_ADD_S", "40"))
     est_chunk = int(env("MEM0_DOC_EST_CHUNK_S", "35"))
+    est_update = int(env("MEM0_QUEUE_EST_UPDATE_S", "15"))
     try:
         by_kind = queue.queue_status().get("depth_by_kind", {})
         conversations = by_kind.get("conversation", 0)
+        updates = by_kind.get("update", 0)
         doc_chunks = queue.pending_document_chunks()
-        return conversations * est_add + doc_chunks * est_chunk
+        return conversations * est_add + updates * est_update + doc_chunks * est_chunk
     except Exception:
         return queue.depth() * est_add
 
@@ -642,10 +644,59 @@ def _register_tools(mcp: FastMCP) -> None:
         memory_id: Annotated[str, Field(description="Exact memory UUID to update.")],
         text: Annotated[str, Field(description="Replacement text for the memory.")],
     ) -> str:
-        """Overwrite an existing memory's text. Re-embeds and re-indexes."""
+        """Update an existing memory's text.
+
+        ASYNCHRONOUS by default (when MEM0_ASYNC_INGEST != false): validates the
+        memory exists, then returns {"status": "queued", "task_id", ...} immediately
+        while the re-embed + metadata re-classification (a slow llama3.1:8b call) run in
+        the background worker — so the call never times out the client. Poll
+        memory_task_status(task_id) for the result (memory_id / UPDATE event);
+        memory_history(memory_id) shows the old-vs-new diff. An identical re-submit
+        while the job is still active returns the same task_id (no double-apply). Set
+        MEM0_ASYNC_INGEST=false for the synchronous path.
+        """
         mem = _ensure_memory()
         if mem is None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+
+        if _async_ingest_enabled():
+            try:
+                # Validate + resolve owner scope at submit: fail fast on a bad id
+                # (never enqueue a doomed job) and scope the job to the memory's
+                # owner so pending_ingest/purge stay correct.
+                existing = mem.get(memory_id)
+                if not existing:
+                    return json.dumps({"error": "memory not found", "memory_id": memory_id}, ensure_ascii=False)
+                uid = existing.get("user_id") or get_default_user_id()
+                queue, worker = _get_ingest()
+                # Sentinel messages encode memory_id+text so the idempotency key
+                # (scope + messages) distinguishes distinct updates AND collapses an
+                # identical retry onto the same task_id; the worker reads the real
+                # memory_id/text from params.
+                sentinel = [{"role": "user", "content": f"[update memory_id={memory_id}]\n{text}"}]
+                res = queue.enqueue(
+                    user_id=uid,
+                    agent_id=existing.get("agent_id") or None,
+                    run_id=existing.get("run_id") or None,
+                    messages=sentinel,
+                    params={"memory_id": memory_id, "text": text},
+                    kind="update",
+                )
+                worker.notify()
+                envelope: dict[str, Any] = {
+                    "status": "queued",
+                    "task_id": res["task_id"],
+                    "submitted_at": res["submitted_at"],
+                    "queue_depth": res["queue_depth"],
+                    "estimated_wait_s": _estimate_wait_s(queue),
+                }
+                if res["duplicate"]:
+                    envelope["duplicate"] = True
+                    envelope["note"] = "identical update already queued; returning the existing task"
+                return json.dumps(envelope, ensure_ascii=False)
+            except Exception as exc:
+                # A broken queue must not drop the update — fall through to sync.
+                logger.error("Async update enqueue failed, falling back to sync update: %s", exc)
 
         def _do_update():
             mem.update(memory_id, data=text)
