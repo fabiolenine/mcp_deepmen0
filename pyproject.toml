@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mem0-mcp-selfhosted"
-version = "0.0.0"
+version = "0.1.0"
 description = "Self-hosted mem0 MCP server for Claude Code"
 license = "MIT"
 requires-python = ">=3.10"
@@ -30,6 +30,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
+
 
 
 [tool.hatch.build.targets.wheel]
