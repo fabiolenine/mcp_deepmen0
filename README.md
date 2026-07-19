@@ -1,12 +1,10 @@
 # mem0-mcp-selfhosted
 
-> **DeepMem0 companion** — a fork of [`elvismdev/mem0-mcp-selfhosted`](https://github.com/elvismdev/mem0-mcp-selfhosted) (MIT) that adds a durable **async ingestion queue** (record-time contracts), **document ingestion** (digital PDFs via poppler; scanned PDFs and images via a local vision model / OCR), page-aware **chunking with provenance**, a cross-encoder **reranker** with tunable `max_length`, and **temporal supersedence**. 15 MCP tools. Upstream copyright and MIT license are preserved in `LICENSE`.
-
 <a href="https://glama.ai/mcp/servers/elvismdev/mem0-mcp-selfhosted"><img width="380" height="200" src="https://glama.ai/mcp/servers/elvismdev/mem0-mcp-selfhosted/badge?v=1" alt="mem0-mcp-selfhosted MCP server" /></a>
 
 Self-hosted [mem0](https://github.com/mem0ai/mem0) MCP server for Claude Code. Run a complete memory server against self-hosted Qdrant + Neo4j + Ollama, with your choice of Anthropic (Claude) or Ollama as the main LLM.
 
-Uses the `mem0ai` package directly as a library, supports both Claude's OAT token and fully local Ollama setups, and exposes 15 MCP tools for full memory management.
+Uses the `mem0ai` package directly as a library, supports both Claude's OAT token and fully local Ollama setups, and exposes 11 MCP tools for full memory management.
 
 ## Prerequisites
 

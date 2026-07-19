@@ -96,6 +96,37 @@ def _get_ingest() -> tuple[IngestQueue, IngestWorker]:
         return _ingest_queue, _ingest_worker
 
 
+_VALID_MEMORY_SCOPES = {"user_fact", "system_meta", "eval_meta", "project_meta"}
+_VALID_SCOPE_EVIDENCE = {"decisive", "strong", "weak", "conflicting", "none"}
+
+
+def _validate_scope_metadata(metadata: dict | None) -> str | None:
+    """Contrato memory_scope v1 (Passo 2 — campo PASSIVO, sem routing).
+
+    memory_scope é enum de 4 valores ou null/ausente (abstention); evidência é
+    NÍVEL, nunca decimal. Se o caller fornece memory_scope válido, carimba a
+    proveniência default (version=1, source=manual) sem sobrescrever o que veio.
+    Retorna mensagem de erro ou None se ok (metadata é mutada in-place).
+    """
+    if not metadata:
+        return None
+    if "memory_scope" in metadata:
+        scope = metadata["memory_scope"]
+        if scope is not None and scope not in _VALID_MEMORY_SCOPES:
+            return (f"memory_scope inválido: {scope!r} — use um de "
+                    f"{sorted(_VALID_MEMORY_SCOPES)} ou null (abstention)")
+        if scope is None:
+            metadata.pop("memory_scope")  # ausência == null; não persistir a chave
+        else:
+            metadata.setdefault("memory_scope_version", 1)
+            metadata.setdefault("memory_scope_source", "manual")
+    ev = metadata.get("memory_scope_evidence")
+    if ev is not None and ev not in _VALID_SCOPE_EVIDENCE:
+        return (f"memory_scope_evidence inválido: {ev!r} — use nível "
+                f"{sorted(_VALID_SCOPE_EVIDENCE)} (nunca decimal não-calibrado)")
+    return None
+
+
 def _estimate_wait_s(queue: IngestQueue) -> int:
     """Kind-aware drain estimate: conversations cost EST_ADD_S each, documents
     cost EST_CHUNK_S per remaining chunk — queue_depth × 40s lies by an order
@@ -282,6 +313,10 @@ def _register_tools(mcp: FastMCP) -> None:
         """
         uid = user_id or get_default_user_id()
 
+        scope_err = _validate_scope_metadata(metadata)
+        if scope_err:
+            return json.dumps({"error": scope_err}, ensure_ascii=False)
+
         # Build messages for mem0ai
         if messages:
             msgs = messages
@@ -382,6 +417,10 @@ def _register_tools(mcp: FastMCP) -> None:
         if not bool_env("MEM0_DOC_ENABLED", "true"):
             return json.dumps({"error": "document ingestion is disabled (MEM0_DOC_ENABLED=false)"}, ensure_ascii=False)
         uid = user_id or get_default_user_id()
+
+        scope_err = _validate_scope_metadata(metadata)
+        if scope_err:
+            return json.dumps({"error": scope_err}, ensure_ascii=False)
 
         def _do_submit():
             queue, worker = _get_ingest()
@@ -530,11 +569,17 @@ def _register_tools(mcp: FastMCP) -> None:
         # task_id: provenance — which async submission a memory came from.
         # source_doc/page/chunk: document provenance (v0.5a) — which file and
         # page a fact was extracted from.
+        # memory_scope*: ontologia v1 (Passo 2 — campo passivo; routing BLOQUEADO
+        # até o Passo 4). O DeepMem0 promove memory_scope ao topo do resultado;
+        # os campos auxiliares de proveniência ficam na metadata e precisam da
+        # whitelist p/ serem visíveis aos clientes.
         _metadata_whitelist = {
             "importance", "domain", "tags", "memory_type",
             "superseded_by", "superseded_at", "supersedes", "event_date",
             "task_id", "source_doc", "page_start", "page_end", "chunk_index",
             "content_type",
+            "memory_scope", "memory_scope_version", "memory_scope_source",
+            "memory_scope_evidence", "memory_scope_reason",
         }
 
         def _do_search():
