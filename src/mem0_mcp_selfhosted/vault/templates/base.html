@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>DeepMem0 Vault</title>
+  <!-- Sem Google Fonts: uma UI de credenciais numa LAN não deve depender da
+       internet nem contar a um terceiro quando o admin a abre. A pilha de
+       fallback do vault.css cobre os três papéis (display/corpo/mono) com
+       fontes de sistema. -->
+  <link rel="stylesheet" href="/static/vault.css">
+  <script src="/static/htmx.min.js" defer></script>
+  <script src="/static/vault-copy.js" defer></script>
+</head>
+<body>
+{% block body %}{% endblock %}
+</body>
+</html>

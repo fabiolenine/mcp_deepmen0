@@ -5,7 +5,7 @@ into text so it can flow through the exact v0.5a chunk → fact-extraction
 pipeline. Nothing leaves the host: pdftoppm rasterizes locally and the VLM
 runs on the local Ollama GPU.
 
-Model choice (measured on an 8GB consumer GPU): ``qwen3-vl:4b-instruct``.
+Model choice (measured on the , an 8GB GPU): ``qwen3-vl:4b-instruct``.
 The bare ``qwen3-vl`` is a *thinking* model — it spends its whole token budget
 reasoning and returns an EMPTY transcription; the ``-instruct`` variant
 transcribes faithfully (accurate Portuguese, numbers and acronyms) at ~7s per

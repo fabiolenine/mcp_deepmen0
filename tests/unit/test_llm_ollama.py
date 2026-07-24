@@ -19,7 +19,7 @@ from mem0_mcp_selfhosted.llm_ollama import (
 def mock_ollama_config():
     """Create a mock OllamaConfig for OllamaToolLLM."""
     config = MagicMock()
-    config.model = "qwen3:14b"
+    config.model = "llama3.1:8b"
     config.temperature = 0.7
     config.max_tokens = 8192
     config.top_p = 0.9

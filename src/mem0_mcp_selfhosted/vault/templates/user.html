@@ -1,0 +1,99 @@
+{% extends "shell.html" %}
+{% block page %}
+{% set hue = avatar_hue(user.email) %}
+<div class="page">
+  <a class="btn-link" href="/">← {{ t.back }}</a>
+
+  <div class="user-head">
+    <div class="id">
+      <div class="avatar lg" style="background:oklch(0.92 0.04 {{ hue }});color:oklch(0.4 0.13 {{ hue }})">
+        {{ initials(user.display_name or user.email) }}
+      </div>
+      <div class="txt">
+        <div class="line">
+          <h1>{{ user.display_name or user.email }}</h1>
+          {% if user.disabled_at %}
+          <span class="badge danger">{{ t.disabled }}</span>
+          {% else %}
+          <span class="badge ok">{{ t.active }}</span>
+          {% endif %}
+        </div>
+        <span class="mail">{{ user.email }}</span>
+      </div>
+    </div>
+
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <form method="post" action="/users/{{ user.id }}/{{ 'enable' if user.disabled_at else 'disable' }}">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button class="btn-ghost danger" type="submit">
+          {{ t.enable if user.disabled_at else t.disable }}
+        </button>
+      </form>
+      {% if not user.disabled_at %}
+      <form method="post" action="/users/{{ user.id }}/tokens"
+            hx-post="/users/{{ user.id }}/tokens" hx-target="#modal-slot" hx-swap="innerHTML"
+            style="display:flex;gap:8px;align-items:center">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <input type="text" name="label" placeholder="{{ t.tokenLabelPh }}" maxlength="60">
+        <button class="btn" type="submit">+ {{ t.genToken }}</button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if error %}
+  <p class="form-error"><span class="dot"></span>{{ error }}</p>
+  {% endif %}
+
+  <div class="card table">
+    <div class="head cols-tokens">
+      <span>{{ t.colLabel }}</span><span>{{ t.colPrefix }}</span><span>{{ t.colCreated }}</span>
+      <span>{{ t.colExpires }}</span><span>{{ t.colLast }}</span>
+      <span style="text-align:right">{{ t.colActions }}</span>
+    </div>
+    {% for tk in tokens %}
+    {% set status = token_status(tk) %}
+    <div class="row cols-tokens">
+      <div style="display:flex;flex-direction:column;gap:3px">
+        <span style="font-size:13.5px;font-weight:600">{{ tk.label or '—' }}</span>
+        {% if status == 'revoked' %}
+        <span class="badge danger">{{ t.revoked }}</span>
+        {% elif status == 'expiring' %}
+        <span class="badge warn">{{ t.expiring }}</span>
+        {% else %}
+        <span class="badge ok">{{ t.active }}</span>
+        {% endif %}
+      </div>
+      <span class="chip">{{ tk.prefix }}…</span>
+      <span class="cell">{{ humanize(tk.created_at, lang) }}</span>
+      <span class="cell">{{ humanize(tk.expires_at, lang) if tk.expires_at else t.never }}</span>
+      <span class="cell">{{ humanize(tk.last_used_at, lang) }}</span>
+      <div class="actions">
+        {% if status != 'revoked' %}
+        <form method="post" action="/tokens/{{ tk.id }}/rotate"
+              hx-post="/tokens/{{ tk.id }}/rotate" hx-target="#modal-slot" hx-swap="innerHTML">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="user_id" value="{{ user.id }}">
+          <button class="btn-ghost btn-small" type="submit">{{ t.rotate }}</button>
+        </form>
+        <form method="post" action="/tokens/{{ tk.id }}/revoke">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <input type="hidden" name="user_id" value="{{ user.id }}">
+          <button class="btn-ghost btn-small danger" type="submit">{{ t.revoke }}</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+    {% else %}
+    <div class="empty">{{ t.noTokens }}</div>
+    {% endfor %}
+  </div>
+
+  <p class="note">{{ t.rotateNote.format(hours=grace_hours) }}</p>
+  <p class="note">{{ t.revokeNote }}</p>
+</div>
+{% endblock %}
+
+{% block modal %}
+{% if token %}{% include "partials/token_modal.html" %}{% endif %}
+{% endblock %}

@@ -76,6 +76,9 @@ DOC_EXTRACTION_INSTRUCTIONS = (
     "(do not write \"User prefers/said...\").\n"
     "- Keep each fact self-contained and specific (include names and values); "
     "skip boilerplate, headers, page furniture and bibliographic references.\n"
+    "- Dates are historical facts of the document: record them EXACTLY as written. "
+    "If a date has no year, do NOT add one (neither today's year nor any other); "
+    "keep it partial. Never change a written year.\n"
     "- Write the facts in the same language as the document."
 )
 
@@ -545,13 +548,33 @@ class IngestWorker:
                 "metadata": metadata,
                 "infer": params.get("infer", True),
                 "prompt": DOC_EXTRACTION_INSTRUCTIONS,
+                # DeepMem0: a document's dates are historical — don't let the
+                # extractor resolve year-less dates against ingestion time (the
+                # "17 out" -> 2026 corruption). Needs a fork that accepts it.
+                "temporal_context": "document",
             }
             for scope_key in ("user_id", "agent_id", "run_id"):
                 if job.get(scope_key):
                     kwargs[scope_key] = job[scope_key]
 
             def _do_add(content=content, kwargs=kwargs):
-                return mem.add([{"role": "user", "content": content}], **kwargs)
+                msgs = [{"role": "user", "content": content}]
+                try:
+                    return mem.add(msgs, **kwargs)
+                except TypeError as e:
+                    # older fork without temporal_context: degrade, don't crash —
+                    # but LOUDLY (fail-open é o pior: o fix do ano some sem sinal).
+                    # Guard ESTREITO: só mismatch de assinatura conta; um TypeError
+                    # interno qualquer que mencione temporal_context deve PROPAGAR.
+                    msg = str(e)
+                    if "temporal_context" not in msg or "unexpected keyword" not in msg:
+                        raise
+                    logger.warning(
+                        "fork sem temporal_context — extração de documento SEM proteção "
+                        "de data (ano pode alucinar). Reinstale o fork >=91ec999 + restart."
+                    )
+                    return mem.add(msgs, **{k: v for k, v in kwargs.items()
+                                           if k != "temporal_context"})
 
             try:
                 if self.call_with_graph is not None:

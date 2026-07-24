@@ -60,7 +60,7 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             f"Supported: {list(_supported_llm_providers)}"
         )
 
-    _llm_model_defaults = {"anthropic": "claude-opus-4-6", "ollama": "qwen3:14b"}
+    _llm_model_defaults = {"anthropic": "claude-opus-4-6", "ollama": "llama3.1:8b"}
     llm_model = env("MEM0_LLM_MODEL", _llm_model_defaults[llm_provider])
     llm_max_tokens = int(env("MEM0_LLM_MAX_TOKENS", "16384"))
 
@@ -211,6 +211,16 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         temporality_config["superseded_penalty"] = float(env("MEM0_SUPERSEDED_PENALTY", "0.2"))
     if opt_env("MEM0_EXTRACT_EVENT_DATE") is not None:
         temporality_config["extract_event_date"] = bool_env("MEM0_EXTRACT_EVENT_DATE")
+    # DeepMem0 v0.6: event-date-aware ranking. event_ranking on by default in the
+    # fork; weight=0 = tie-break-only (no fusion divisor growth).
+    if opt_env("MEM0_EVENT_RANKING") is not None:
+        temporality_config["event_ranking"] = bool_env("MEM0_EVENT_RANKING")
+    if opt_env("MEM0_EVENT_RANKING_WEIGHT"):
+        temporality_config["event_ranking_weight"] = float(env("MEM0_EVENT_RANKING_WEIGHT", "0.15"))
+    if opt_env("MEM0_EVENT_WINDOW_DAYS"):
+        temporality_config["event_window_days"] = int(env("MEM0_EVENT_WINDOW_DAYS", "30"))
+    if opt_env("MEM0_EVENT_TIE_BAND"):
+        temporality_config["event_tie_band"] = float(env("MEM0_EVENT_TIE_BAND", "0.05"))
     if temporality_config:
         config_dict["temporality"] = temporality_config
 

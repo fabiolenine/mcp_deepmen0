@@ -43,6 +43,8 @@ from mem0_mcp_selfhosted.image_extract import vision_enabled
 from mem0_mcp_selfhosted.ingest_queue import IngestQueue, idempotency_key
 from mem0_mcp_selfhosted.ingest_worker import IngestWorker
 from mem0_mcp_selfhosted.pdf_extract import EncryptedPdf, pdf_info
+from mem0_mcp_selfhosted.vault import middleware as vault_middleware
+from mem0_mcp_selfhosted.vault import store as vault_store
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,132 @@ def _queue_db_path() -> str:
     if history:
         return str(Path(history).parent / "ingest_queue.db")
     return str(Path.home() / ".mem0" / "ingest_queue.db")
+
+
+def _vault_db_path() -> str:
+    """Vault database shared with the :8080 UI (same absolute path in both units)."""
+    explicit = env("MEM0_VAULT_DB_PATH")
+    if explicit:
+        return explicit
+    return str(Path.home() / ".mem0" / "vault.db")
+
+
+def _auth_mode() -> str:
+    """Effective MEM0_REQUIRE_AUTH mode; a typo raises instead of downgrading."""
+    return vault_middleware.normalize_mode(env("MEM0_REQUIRE_AUTH"))
+
+
+def _current_principal() -> dict[str, Any] | None:
+    """The vault principal for the in-flight request, if the gate resolved one.
+
+    Two lookups because the MCP SDK dispatches tool calls on a task of its own:
+    the middleware's contextvar may not survive that hop, but the ASGI scope
+    always does (the SDK hands the Starlette request to the request context).
+    """
+    principal = vault_middleware.current_principal.get()
+    if principal is not None:
+        return principal
+    try:
+        from mcp.server.lowlevel.server import request_ctx
+
+        request = request_ctx.get().request
+        if request is not None:
+            return request.scope.get("state", {}).get("vault_user")
+    except Exception:  # noqa: BLE001 - no HTTP request in flight (stdio/tests)
+        return None
+    return None
+
+
+def _effective_user_id(user_id: str | None) -> tuple[str, str | None]:
+    """Resolve the memory scope for a tool call. Returns ``(uid, error)``.
+
+    Authorization contract: a token bound to a ``mem0_user_id`` WINS over
+    whatever the client asks for, and a client that explicitly asks for a
+    different scope gets an error — never a silent redirect to its own data.
+    A token with an empty ``mem0_user_id`` (every token in the current phase)
+    keeps today's behavior exactly: client value, else MEM0_USER_ID.
+    """
+    principal = _current_principal()
+    bound = (principal or {}).get("mem0_user_id") or ""
+    if not bound:
+        return (user_id or get_default_user_id()), None
+    if user_id and user_id != bound:
+        return "", (
+            f"token is bound to user_id '{bound}' and cannot access '{user_id}'"
+        )
+    return bound, None
+
+
+#: How each tool decides what a request may touch. Every registered tool MUST
+#: appear here — a completeness test fails the build otherwise, so tool #16
+#: cannot quietly ship without an authorization decision.
+#:
+#:   scope-arg     — takes a user_id argument; resolved by _effective_user_id
+#:   record-owner  — addresses a record by id; the record's owner is checked
+#:   filtered      — enumerates; the answer is narrowed to the bound scope
+#:   operator-only — global/operational; refused to a scope-bound token
+TOOL_SCOPE_POLICY: dict[str, str] = {
+    "add_memory": "scope-arg",
+    "add_document": "scope-arg",
+    "search_memories": "scope-arg",
+    "get_memories": "scope-arg",
+    "delete_all_memories": "scope-arg",
+    "delete_entities": "scope-arg",
+    "update_memory": "record-owner",
+    "get_memory": "record-owner",
+    "memory_history": "record-owner",
+    "delete_memory": "record-owner",
+    "memory_task_status": "record-owner",
+    "list_entities": "filtered",
+    "memory_queue_status": "operator-only",
+    "mcp_search_graph": "operator-only",
+    "mcp_get_entity": "operator-only",
+}
+
+
+def _bound_scope() -> str:
+    """The mem0 scope this request is locked to; '' when the token is unbound.
+
+    Every token issued today is unbound, so all the checks below are no-ops
+    with zero extra I/O — they exist so binding a token is a complete change
+    and not a half-enforced one.
+    """
+    return (_current_principal() or {}).get("mem0_user_id") or ""
+
+
+def _authorize_owner(owner: str | None) -> str | None:
+    """None when the in-flight principal may touch a record owned by ``owner``."""
+    bound = _bound_scope()
+    if not bound or (owner or "") == bound:
+        return None
+    return "not accessible with this token"
+
+
+def _authorize_memory_id(mem: Any, memory_id: str) -> str | None:
+    """Ownership guard for id-addressed tools. One extra read, bound tokens only.
+
+    A record owned by someone else and a record that does not exist give the
+    SAME answer: a scoped token must not be able to probe which ids are real.
+    """
+    if not _bound_scope():
+        return None
+    try:
+        record = mem.get(memory_id)
+    except Exception:  # noqa: BLE001 - treat a failed lookup as not-found
+        record = None
+    if not record or _authorize_owner(record.get("user_id")):
+        return f"memory not found: {memory_id}"
+    return None
+
+
+def _operator_only(tool: str) -> str | None:
+    """Refuse global/operational tools to a scope-bound token."""
+    if not _bound_scope():
+        return None
+    return (
+        f"{tool} reports on the whole server and is not available to a "
+        f"scope-bound token"
+    )
 
 
 def _get_ingest() -> tuple[IngestQueue, IngestWorker]:
@@ -131,9 +259,18 @@ def _estimate_wait_s(queue: IngestQueue) -> int:
     """Kind-aware drain estimate: conversations cost EST_ADD_S each, documents
     cost EST_CHUNK_S per remaining chunk — queue_depth × 40s lies by an order
     of magnitude once a document is in line."""
-    est_add = int(env("MEM0_QUEUE_EST_ADD_S", "40"))
-    est_chunk = int(env("MEM0_DOC_EST_CHUNK_S", "35"))
-    est_update = int(env("MEM0_QUEUE_EST_UPDATE_S", "15"))
+    # Defaults recalibrados  por perda ASSIMÉTRICA:
+    # subestimar faz o cliente MCP dar retry (quase gerou add duplicado no passado);
+    # superestimar só faz o cliente esperar/pollar. Por isso p75, não p50.
+    #  - ADD 180: service time real started->finished p75=184s (n=43, jul/2026;
+    #    p50=64/p90=279/max=391; NÃO inclui queue-wait, medido p50=0).
+    #  - CHUNK 120: digital-quente ~120s/chunk (n=39); OCR 75 (infer=false) a 135
+    #    (infer=true+swaps de modelo) — valor conservador único, extração GPU-bound.
+    #  - UPDATE 200 PROVISÓRIO: só n=2 (158/197s, classificador inline domina).
+    # Ver docs/mem0-docs/cpu-upgrade-remedicao.md (registro autoritativo).
+    est_add = int(env("MEM0_QUEUE_EST_ADD_S", "180"))
+    est_chunk = int(env("MEM0_DOC_EST_CHUNK_S", "120"))
+    est_update = int(env("MEM0_QUEUE_EST_UPDATE_S", "200"))
     try:
         by_kind = queue.queue_status().get("depth_by_kind", {})
         conversations = by_kind.get("conversation", 0)
@@ -279,8 +416,36 @@ def _create_server() -> FastMCP:
 
     _register_tools(mcp)
     _register_prompts(mcp)
+    _register_health(mcp)
 
     return mcp
+
+
+def _register_health(mcp: FastMCP) -> None:
+    """Liveness + readiness, exempt from the vault gate (see middleware).
+
+    Readiness reports the vault database because ``MEM0_REQUIRE_AUTH=on`` with
+    an unreadable vault denies every request — an operator must be able to see
+    that from outside without reading logs.
+    """
+    from starlette.responses import JSONResponse
+
+    @mcp.custom_route("/health", methods=["GET"])
+    async def health(request):  # noqa: ANN001, ARG001 - starlette signature
+        try:
+            mode = _auth_mode()
+        except ValueError as exc:
+            mode = f"invalid: {exc}"
+        vault_db = vault_store.probe(_vault_db_path()) if mode != "off" else "not_required"
+        degraded = mode == "on" and vault_db != "ok"
+        return JSONResponse(
+            {
+                "status": "degraded" if degraded else "ok",
+                "auth_mode": mode,
+                "vault_db": vault_db,
+            },
+            status_code=503 if degraded else 200,
+        )
 
 
 # ============================================================
@@ -311,7 +476,9 @@ def _register_tools(mcp: FastMCP) -> None:
           — synchronous path; empty memory_ids carries "reason": "no_new_facts".
         - {"error": ...} — failure.
         """
-        uid = user_id or get_default_user_id()
+        uid, auth_err = _effective_user_id(user_id)
+        if auth_err:
+            return json.dumps({"error": auth_err}, ensure_ascii=False)
 
         scope_err = _validate_scope_metadata(metadata)
         if scope_err:
@@ -416,7 +583,9 @@ def _register_tools(mcp: FastMCP) -> None:
         """
         if not bool_env("MEM0_DOC_ENABLED", "true"):
             return json.dumps({"error": "document ingestion is disabled (MEM0_DOC_ENABLED=false)"}, ensure_ascii=False)
-        uid = user_id or get_default_user_id()
+        uid, auth_err = _effective_user_id(user_id)
+        if auth_err:
+            return json.dumps({"error": auth_err}, ensure_ascii=False)
 
         scope_err = _validate_scope_metadata(metadata)
         if scope_err:
@@ -510,10 +679,14 @@ def _register_tools(mcp: FastMCP) -> None:
         domain: Annotated[str | None, Field(description="Keep only memories whose classified domain matches (e.g. career, ai, data, software_engineering, finance, trading, health, education, personal, legal, business, infrastructure).")] = None,
         memory_type: Annotated[str | None, Field(description="Keep only memories of this classified type: semantic, episodic, or procedural.")] = None,
         sort_by_importance: Annotated[bool | None, Field(description="Sort results by classified importance descending.")] = None,
-        as_of: Annotated[str | None, Field(description="Temporal anchor (ISO date or datetime): return what was known/current on that date — memories created later are excluded and facts superseded only after the anchor carry no demotion.")] = None,
+        as_of: Annotated[str | None, Field(description="Record-time anchor (ISO date or datetime): return what was known/current on that date — memories created later are excluded and facts superseded only after the anchor carry no demotion.")] = None,
+        event_from: Annotated[str | None, Field(description="Event-time window start (inclusive). Full or partial ISO date: '2023' = whole year, '2023-10' = whole month, '2023-10-17' = that day. Filters on WHEN the fact happened (event_date), distinct from as_of's record-time. Memories without an event_date are EXCLUDED while the window is active. Either side alone = open interval. When neither event_from/event_to is given, a single date named in the query auto-anchors ranking without excluding anything.")] = None,
+        event_to: Annotated[str | None, Field(description="Event-time window end (inclusive), same partial-date expansion as event_from.")] = None,
     ) -> str:
         """Semantic search across existing memories."""
-        uid = user_id or get_default_user_id()
+        uid, auth_err = _effective_user_id(user_id)
+        if auth_err:
+            return json.dumps({"error": auth_err}, ensure_ascii=False)
 
         kwargs: dict[str, Any] = {"user_id": uid, "query": query}
         if agent_id:
@@ -559,6 +732,18 @@ def _register_tools(mcp: FastMCP) -> None:
                     ensure_ascii=False,
                 )
             kwargs["as_of"] = as_of
+        if event_from or event_to:
+            # DeepMem0 v0.6: janela event-time (event_date). Fork-only, mesmo guard
+            # do as_of — mem0ai upstream engoliria os kwargs em silêncio.
+            if not _core_overfetches:
+                return json.dumps(
+                    {"error": "event_from/event_to requerem o runtime DeepMem0 >= 0.6 (mem0ai upstream não suporta)"},
+                    ensure_ascii=False,
+                )
+            if event_from:
+                kwargs["event_from"] = event_from
+            if event_to:
+                kwargs["event_to"] = event_to
 
         mem = _ensure_memory()
 
@@ -614,7 +799,9 @@ def _register_tools(mcp: FastMCP) -> None:
         limit: Annotated[int | None, Field(description="Maximum number of memories to return.")] = None,
     ) -> str:
         """Page through memories using filters instead of search."""
-        uid = user_id or get_default_user_id()
+        uid, auth_err = _effective_user_id(user_id)
+        if auth_err:
+            return json.dumps({"error": auth_err}, ensure_ascii=False)
 
         kwargs: dict[str, Any] = {"user_id": uid}
         if agent_id:
@@ -637,7 +824,17 @@ def _register_tools(mcp: FastMCP) -> None:
         mem = _ensure_memory()
         if mem is None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
-        return _mem0_call(mem.get, memory_id)
+
+        def _do_get():
+            record = mem.get(memory_id)
+            if not record:
+                return {"error": f"memory not found: {memory_id}"}
+            if _authorize_owner(record.get("user_id")):
+                # indistinguishable from "does not exist", on purpose
+                return {"error": f"memory not found: {memory_id}"}
+            return record
+
+        return _mem0_call(_do_get)
 
     @mcp.tool()
     def memory_history(
@@ -647,6 +844,10 @@ def _register_tools(mcp: FastMCP) -> None:
         mem = _ensure_memory()
         if mem is None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+
+        denied = _authorize_memory_id(mem, memory_id)
+        if denied:
+            return json.dumps({"error": denied}, ensure_ascii=False)
         return _mem0_call(mem.history, memory_id)
 
     @mcp.tool()
@@ -665,6 +866,8 @@ def _register_tools(mcp: FastMCP) -> None:
             row = queue.task_status(task_id)
             if row is None:
                 return {"error": f"unknown task_id: {task_id}"}
+            if _authorize_owner(row.get("user_id")):
+                return {"error": f"unknown task_id: {task_id}"}
             return row
 
         return _mem0_call(_do_status)
@@ -674,6 +877,10 @@ def _register_tools(mcp: FastMCP) -> None:
         """Health of the async ingest queue: depth (jobs waiting or running),
         per-status counts, age of the oldest pending job, estimated drain time,
         and whether the background worker is alive."""
+        denied = _operator_only("memory_queue_status")
+        if denied:
+            return json.dumps({"error": denied}, ensure_ascii=False)
+
         def _do_queue_status():
             queue, worker = _get_ingest()
             status = queue.queue_status()
@@ -712,7 +919,9 @@ def _register_tools(mcp: FastMCP) -> None:
                 existing = mem.get(memory_id)
                 if not existing:
                     return json.dumps({"error": "memory not found", "memory_id": memory_id}, ensure_ascii=False)
-                uid = existing.get("user_id") or get_default_user_id()
+                uid, auth_err = _effective_user_id(existing.get("user_id"))
+                if auth_err:
+                    return json.dumps({"error": auth_err}, ensure_ascii=False)
                 queue, worker = _get_ingest()
                 # Sentinel messages encode memory_id+text so the idempotency key
                 # (scope + messages) distinguishes distinct updates AND collapses an
@@ -743,6 +952,10 @@ def _register_tools(mcp: FastMCP) -> None:
                 # A broken queue must not drop the update — fall through to sync.
                 logger.error("Async update enqueue failed, falling back to sync update: %s", exc)
 
+        denied = _authorize_memory_id(mem, memory_id)
+        if denied:
+            return json.dumps({"error": denied}, ensure_ascii=False)
+
         def _do_update():
             mem.update(memory_id, data=text)
             return {"message": "Memory updated successfully!"}
@@ -757,6 +970,10 @@ def _register_tools(mcp: FastMCP) -> None:
         mem = _ensure_memory()
         if mem is None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
+
+        denied = _authorize_memory_id(mem, memory_id)
+        if denied:
+            return json.dumps({"error": denied}, ensure_ascii=False)
 
         def _do_delete():
             mem.delete(memory_id)
@@ -774,7 +991,9 @@ def _register_tools(mcp: FastMCP) -> None:
 
         NEVER calls memory.delete_all() — uses safe bulk-delete instead.
         """
-        uid = user_id or get_default_user_id()
+        uid, auth_err = _effective_user_id(user_id)
+        if auth_err:
+            return json.dumps({"error": auth_err}, ensure_ascii=False)
         if not any([uid, agent_id, run_id]):
             return json.dumps(
                 {"error": "At least one scope (user_id, agent_id, or run_id) is required."},
@@ -815,7 +1034,13 @@ def _register_tools(mcp: FastMCP) -> None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
 
         def _do_list():
-            return list_entities_facet(mem)
+            entities = list_entities_facet(mem)
+            bound = _bound_scope()
+            if bound and isinstance(entities, dict) and isinstance(entities.get("users"), list):
+                # a scoped token learns that it exists, and nothing about anyone else
+                entities = {**entities, "users": [u for u in entities["users"]
+                                                  if (u.get("value") if isinstance(u, dict) else u) == bound]}
+            return entities
 
         return _mem0_call(_do_list)
 
@@ -834,6 +1059,11 @@ def _register_tools(mcp: FastMCP) -> None:
                 {"error": "At least one scope (user_id, agent_id, or run_id) is required."},
                 ensure_ascii=False,
             )
+
+        if user_id or _bound_scope():
+            user_id, auth_err = _effective_user_id(user_id)
+            if auth_err:
+                return json.dumps({"error": auth_err}, ensure_ascii=False)
 
         filters: dict[str, Any] = {}
         if user_id:
@@ -862,6 +1092,9 @@ def _register_tools(mcp: FastMCP) -> None:
         query: Annotated[str, Field(description="Entity or topic to search for (e.g., 'Python', 'TypeScript').")],
     ) -> str:
         """Search entities by name/id substring matching in Neo4j knowledge graph."""
+        denied = _operator_only("mcp_search_graph")
+        if denied:
+            return json.dumps({"error": denied}, ensure_ascii=False)
         return search_graph(query)
 
     @mcp.tool()
@@ -869,6 +1102,9 @@ def _register_tools(mcp: FastMCP) -> None:
         name: Annotated[str, Field(description="Exact entity name to look up.")],
     ) -> str:
         """Get all relationships for a specific entity (bidirectional)."""
+        denied = _operator_only("mcp_get_entity")
+        if denied:
+            return json.dumps({"error": denied}, ensure_ascii=False)
         return get_entity(name)
 
 
@@ -936,8 +1172,52 @@ def run_server() -> None:
     transport = env("MEM0_TRANSPORT", "stdio").lower()
 
     if transport == "sse":
+        # The legacy SSE app is NOT wrapped by the vault gate. Refusing to boot
+        # turns a silent authentication bypass into an obvious failure.
+        if _auth_mode() != vault_middleware.MODE_OFF:
+            raise RuntimeError(
+                "MEM0_REQUIRE_AUTH is set but the legacy 'sse' transport has no "
+                "vault gate — use MEM0_TRANSPORT=streamable-http, or set "
+                "MEM0_REQUIRE_AUTH=off and accept unauthenticated access"
+            )
         server.run(transport="sse")
     elif transport == "streamable-http":
-        server.run(transport="streamable-http")
+        _run_streamable_http(server)
     else:
         server.run(transport="stdio")
+
+
+def _run_streamable_http(server: FastMCP) -> None:
+    """Serve streamable-HTTP behind the vault gate.
+
+    Single code path: build the ASGI app, wrap it, hand it to uvicorn. In
+    ``off`` mode the wrapper delegates without opening the vault, so this is
+    byte-for-byte today's behavior until an operator flips the drop-in.
+    """
+    import uvicorn
+
+    mode = _auth_mode()  # raises on a typo — better at boot than at 3am
+    db_path = _vault_db_path()
+    app = vault_middleware.BearerTokenMiddleware(
+        server.streamable_http_app(), db_path=db_path, mode=mode
+    )
+    if mode == vault_middleware.MODE_OFF:
+        logger.info("Vault auth: off (no token required)")
+    else:
+        logger.info(
+            "Vault auth: %s (db=%s, readiness=%s)", mode, db_path, vault_store.probe(db_path)
+        )
+
+    uvicorn.run(
+        app,
+        host=server.settings.host,
+        port=server.settings.port,
+        log_level=server.settings.log_level.lower(),
+        # Pinned, not inherited: uvicorn already rewrites scope["client"] from
+        # X-Forwarded-For when the peer is trusted, which is what keeps the
+        # vault's denial counters and audit log honest behind a reverse proxy.
+        # These are today's defaults — stated explicitly so a future uvicorn
+        # cannot change them under us, and so the trust boundary is visible.
+        proxy_headers=True,
+        forwarded_allow_ips=env("MEM0_FORWARDED_ALLOW_IPS", "127.0.0.1"),
+    )

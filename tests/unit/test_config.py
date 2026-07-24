@@ -136,13 +136,13 @@ class TestBuildConfig:
         env = {
             "MEM0_ENABLE_GRAPH": "true",
             "MEM0_GRAPH_LLM_PROVIDER": "ollama",
-            "MEM0_GRAPH_LLM_MODEL": "qwen3:14b",
+            "MEM0_GRAPH_LLM_MODEL": "llama3.1:8b",
         }
         config_dict, *_ = self._build_with_env(env)
 
         graph_llm = config_dict["graph_store"]["llm"]
         assert graph_llm["provider"] == "ollama"
-        assert graph_llm["config"]["model"] == "qwen3:14b"
+        assert graph_llm["config"]["model"] == "llama3.1:8b"
 
     def test_graph_llm_gemini(self):
         """Graph LLM can be set to gemini with API key."""
@@ -215,13 +215,13 @@ class TestBuildConfig:
             "MEM0_GRAPH_LLM_PROVIDER": "gemini_split",
             "GOOGLE_API_KEY": "test-gemini-key",
             "MEM0_GRAPH_CONTRADICTION_LLM_PROVIDER": "ollama",
-            "MEM0_GRAPH_CONTRADICTION_LLM_MODEL": "qwen3:14b",
+            "MEM0_GRAPH_CONTRADICTION_LLM_MODEL": "llama3.1:8b",
         }
         config_dict, _, split_config = self._build_with_env(env)
 
         assert split_config is not None
         assert split_config["contradiction_provider"] == "ollama"
-        assert split_config["contradiction_model"] == "qwen3:14b"
+        assert split_config["contradiction_model"] == "llama3.1:8b"
         assert "contradiction_api_key" not in split_config
         assert "contradiction_ollama_base_url" in split_config
 
@@ -278,10 +278,10 @@ class TestBuildConfig:
         assert "max_tokens" not in llm_cfg
 
     def test_ollama_default_model(self):
-        """Ollama provider defaults to qwen3:14b when MEM0_LLM_MODEL not set."""
+        """Ollama provider defaults to llama3.1:8b when MEM0_LLM_MODEL not set."""
         env = {"MEM0_LLM_PROVIDER": "ollama"}
         config_dict, *_ = self._build_with_env(env)
-        assert config_dict["llm"]["config"]["model"] == "qwen3:14b"
+        assert config_dict["llm"]["config"]["model"] == "llama3.1:8b"
 
     def test_ollama_llm_url_custom(self):
         """MEM0_LLM_URL sets ollama_base_url when provider is ollama."""
@@ -369,7 +369,7 @@ class TestBuildConfig:
             "MEM0_ENABLE_GRAPH": "true",
             "MEM0_GRAPH_LLM_PROVIDER": "gemini_split",
             "GOOGLE_API_KEY": "test-gemini-key",
-            # No MEM0_GRAPH_CONTRADICTION_LLM_MODEL set — should NOT inherit qwen3:14b
+            # No MEM0_GRAPH_CONTRADICTION_LLM_MODEL set — should NOT inherit llama3.1:8b
         }
         _, _, split_config = self._build_with_env(env)
         assert split_config is not None
@@ -379,7 +379,7 @@ class TestBuildConfig:
         """Contradiction model inherits main LLM model when provider is ollama."""
         env = {
             "MEM0_LLM_PROVIDER": "ollama",
-            "MEM0_LLM_MODEL": "qwen3:14b",
+            "MEM0_LLM_MODEL": "llama3.1:8b",
             "MEM0_ENABLE_GRAPH": "true",
             "MEM0_GRAPH_LLM_PROVIDER": "gemini_split",
             "MEM0_GRAPH_CONTRADICTION_LLM_PROVIDER": "ollama",
@@ -387,7 +387,7 @@ class TestBuildConfig:
         }
         _, _, split_config = self._build_with_env(env)
         assert split_config is not None
-        assert split_config["contradiction_model"] == "qwen3:14b"
+        assert split_config["contradiction_model"] == "llama3.1:8b"
 
     def test_contradiction_model_explicit_env_overrides_default(self):
         """Explicit MEM0_GRAPH_CONTRADICTION_LLM_MODEL overrides provider-aware default."""
@@ -601,15 +601,15 @@ class TestBuildConfig:
 
     def test_ollama_url_cascades_to_llm(self):
         """MEM0_OLLAMA_URL sets LLM ollama_base_url when MEM0_LLM_URL not set."""
-        env = {"MEM0_LLM_PROVIDER": "ollama", "MEM0_OLLAMA_URL": "http://ollama-host:11434"}
+        env = {"MEM0_LLM_PROVIDER": "ollama", "MEM0_OLLAMA_URL": "http://10.0.0.5:11434"}
         config_dict, *_ = self._build_with_env(env)
-        assert config_dict["llm"]["config"]["ollama_base_url"] == "http://ollama-host:11434"
+        assert config_dict["llm"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
 
     def test_llm_url_overrides_ollama_url(self):
         """MEM0_LLM_URL takes precedence over MEM0_OLLAMA_URL for LLM."""
         env = {
             "MEM0_LLM_PROVIDER": "ollama",
-            "MEM0_OLLAMA_URL": "http://ollama-host:11434",
+            "MEM0_OLLAMA_URL": "http://10.0.0.5:11434",
             "MEM0_LLM_URL": "http://10.0.0.5:11434",
         }
         config_dict, *_ = self._build_with_env(env)
@@ -617,14 +617,14 @@ class TestBuildConfig:
 
     def test_ollama_url_cascades_to_embed(self):
         """MEM0_OLLAMA_URL sets embed ollama_base_url when MEM0_EMBED_URL not set."""
-        env = {"MEM0_OLLAMA_URL": "http://ollama-host:11434"}
+        env = {"MEM0_OLLAMA_URL": "http://10.0.0.5:11434"}
         config_dict, *_ = self._build_with_env(env)
-        assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://ollama-host:11434"
+        assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
 
     def test_embed_url_overrides_ollama_url(self):
         """MEM0_EMBED_URL takes precedence over MEM0_OLLAMA_URL for embed."""
         env = {
-            "MEM0_OLLAMA_URL": "http://ollama-host:11434",
+            "MEM0_OLLAMA_URL": "http://10.0.0.5:11434",
             "MEM0_EMBED_URL": "http://10.0.0.5:11434",
         }
         config_dict, *_ = self._build_with_env(env)
@@ -636,16 +636,16 @@ class TestBuildConfig:
         env = {
             "MEM0_ENABLE_GRAPH": "true",
             "MEM0_GRAPH_LLM_PROVIDER": "ollama",
-            "MEM0_OLLAMA_URL": "http://ollama-host:11434",
+            "MEM0_OLLAMA_URL": "http://10.0.0.5:11434",
         }
         config_dict, *_ = self._build_with_env(env)
-        assert config_dict["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://ollama-host:11434"
+        assert config_dict["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
 
         # MEM0_LLM_URL overrides MEM0_OLLAMA_URL
         env2 = {
             "MEM0_ENABLE_GRAPH": "true",
             "MEM0_GRAPH_LLM_PROVIDER": "ollama",
-            "MEM0_OLLAMA_URL": "http://ollama-host:11434",
+            "MEM0_OLLAMA_URL": "http://10.0.0.5:11434",
             "MEM0_LLM_URL": "http://10.0.0.5:11434",
         }
         config_dict2, *_ = self._build_with_env(env2)
@@ -655,7 +655,7 @@ class TestBuildConfig:
         env3 = {
             "MEM0_ENABLE_GRAPH": "true",
             "MEM0_GRAPH_LLM_PROVIDER": "ollama",
-            "MEM0_OLLAMA_URL": "http://ollama-host:11434",
+            "MEM0_OLLAMA_URL": "http://10.0.0.5:11434",
             "MEM0_LLM_URL": "http://10.0.0.5:11434",
             "MEM0_GRAPH_LLM_URL": "http://gpu-box:11434",
         }
@@ -664,7 +664,7 @@ class TestBuildConfig:
 
     def test_ollama_url_ignored_for_anthropic_provider(self):
         """MEM0_OLLAMA_URL is ignored when LLM provider is anthropic."""
-        env = {"MEM0_OLLAMA_URL": "http://ollama-host:11434"}
+        env = {"MEM0_OLLAMA_URL": "http://10.0.0.5:11434"}
         config_dict, *_ = self._build_with_env(env)
         assert "ollama_base_url" not in config_dict["llm"]["config"]
 
@@ -675,10 +675,10 @@ class TestBuildConfig:
             "MEM0_GRAPH_LLM_PROVIDER": "gemini_split",
             "GOOGLE_API_KEY": "test-key",
             "MEM0_GRAPH_CONTRADICTION_LLM_PROVIDER": "ollama",
-            "MEM0_OLLAMA_URL": "http://ollama-host:11434",
+            "MEM0_OLLAMA_URL": "http://10.0.0.5:11434",
         }
         _, _, split_config = self._build_with_env(env)
-        assert split_config["contradiction_ollama_base_url"] == "http://ollama-host:11434"
+        assert split_config["contradiction_ollama_base_url"] == "http://10.0.0.5:11434"
 
     # --- Whitespace stripping (13.8.x) ---
 
@@ -724,12 +724,53 @@ class TestBuildConfig:
         """MEM0_PROVIDER + MEM0_OLLAMA_URL configure LLM, embed, and graph in one shot."""
         env = {
             "MEM0_PROVIDER": "ollama",
-            "MEM0_OLLAMA_URL": "http://ollama-host:11434",
+            "MEM0_OLLAMA_URL": "http://10.0.0.5:11434",
             "MEM0_ENABLE_GRAPH": "true",
         }
         config_dict, *_ = self._build_with_env(env)
         assert config_dict["llm"]["provider"] == "ollama"
-        assert config_dict["llm"]["config"]["ollama_base_url"] == "http://ollama-host:11434"
-        assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://ollama-host:11434"
+        assert config_dict["llm"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
+        assert config_dict["embedder"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
         assert config_dict["graph_store"]["llm"]["provider"] == "ollama"
-        assert config_dict["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://ollama-host:11434"
+        assert config_dict["graph_store"]["llm"]["config"]["ollama_base_url"] == "http://10.0.0.5:11434"
+
+
+class TestTemporalityConfig(TestBuildConfig):
+    """First build_config coverage for the temporality block (v0.3 + v0.6).
+    Attach-if-nonempty: an all-unset block is omitted so the fork defaults win and
+    the upstream mem0ai runtime (extra=ignore) stays harmless."""
+
+    def test_no_temporality_env_omits_block(self):
+        config_dict, *_ = self._build_with_env({})
+        assert "temporality" not in config_dict
+
+    def test_event_ranking_envs_mapped(self):
+        env = {
+            "MEM0_EVENT_RANKING": "true",
+            "MEM0_EVENT_RANKING_WEIGHT": "0.2",
+            "MEM0_EVENT_WINDOW_DAYS": "45",
+            "MEM0_EVENT_TIE_BAND": "0.08",
+        }
+        config_dict, *_ = self._build_with_env(env)
+        t = config_dict["temporality"]
+        assert t["event_ranking"] is True
+        assert t["event_ranking_weight"] == 0.2
+        assert t["event_window_days"] == 45
+        assert t["event_tie_band"] == 0.08
+
+    def test_event_ranking_disabled_maps_false(self):
+        config_dict, *_ = self._build_with_env({"MEM0_EVENT_RANKING": "false"})
+        assert config_dict["temporality"]["event_ranking"] is False
+
+    def test_weight_zero_maps(self):
+        # weight=0 (tie-break-only escape hatch) must survive the truthy gate:
+        # opt_env("...WEIGHT") returns "0" (truthy string), so it is mapped.
+        config_dict, *_ = self._build_with_env({"MEM0_EVENT_RANKING_WEIGHT": "0"})
+        assert config_dict["temporality"]["event_ranking_weight"] == 0.0
+
+    def test_v03_and_v06_coexist(self):
+        env = {"MEM0_SUPERSEDED_PENALTY": "0.3", "MEM0_EVENT_WINDOW_DAYS": "10"}
+        config_dict, *_ = self._build_with_env(env)
+        t = config_dict["temporality"]
+        assert t["superseded_penalty"] == 0.3
+        assert t["event_window_days"] == 10

@@ -200,6 +200,38 @@ class TestDeepMem0TemporalitySurface:
             "server.py forwards search_memories(as_of=...) into it."
         )
 
+    def test_search_accepts_event_window_on_deepmem0(self):
+        import inspect
+
+        try:
+            import mem0
+            from mem0.memory.main import Memory
+        except ImportError:
+            pytest.skip("mem0 not installed")
+        if not getattr(mem0, "__deepmem0__", False):
+            pytest.skip("upstream runtime: event_from/event_to guarded off in server.py")
+
+        params = inspect.signature(Memory.search).parameters
+        assert "event_from" in params and "event_to" in params, (
+            "INVARIANT BROKEN: DeepMem0 >= 0.6 Memory.search must accept event_from/event_to. "
+            "server.py forwards search_memories(event_from=..., event_to=...) into it."
+        )
+
+    def test_temporality_config_has_event_ranking_field(self):
+        try:
+            import mem0
+            from mem0.configs.base import MemoryTemporalityConfig
+        except ImportError:
+            pytest.skip("mem0 not installed")
+        if not getattr(mem0, "__deepmem0__", False):
+            pytest.skip("upstream runtime: temporality config is ignored")
+
+        fields = MemoryTemporalityConfig.model_fields
+        assert "event_ranking" in fields and "event_window_days" in fields, (
+            "INVARIANT BROKEN: DeepMem0 >= 0.6 MemoryTemporalityConfig must declare event_ranking "
+            "fields. config.py maps MEM0_EVENT_RANKING* onto them."
+        )
+
     def test_memory_exposes_history(self):
         try:
             from mem0.memory.main import Memory

@@ -1,0 +1,128 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ t.navDash }}</h1>
+      <p>{{ t.dashSub }}</p>
+    </div>
+    <a class="btn" href="/?new=1">+ {{ t.newUser }}</a>
+  </div>
+
+  <div class="stats">
+    <div class="stat">
+      <span class="lbl">{{ t.statUsers }}</span>
+      <div class="row">
+        <span class="val">{{ stats.users_active }}</span>
+        <span class="sub">{{ t.ofTotal }} {{ stats.users_total }}</span>
+      </div>
+    </div>
+    <div class="stat">
+      <span class="lbl">{{ t.statTokens }}</span>
+      <div class="row">
+        <span class="val">{{ stats.tokens_active }}</span>
+        <span class="sub">{{ t.ofTotal }} {{ stats.tokens_total }}</span>
+      </div>
+    </div>
+    <div class="stat">
+      <span class="lbl">{{ t.statUsed24h }}</span>
+      <div class="row">
+        <span class="val">{{ seen_24h }}</span>
+        <span class="sub">{{ t.ofTotal }} {{ stats.tokens_active }}</span>
+      </div>
+    </div>
+    <div class="stat">
+      <span class="lbl">{{ t.mcpLabel }}</span>
+      <div class="row">
+        <span class="val">{{ 'OK' if mcp.ok else '—' }}</span>
+        <span class="sub">
+          {% if mcp.code %}/health {{ mcp.code }}{% else %}{{ t.mcpDown }}{% endif %}
+        </span>
+      </div>
+    </div>
+  </div>
+
+  {% if auth_mode != 'on' %}
+  <div class="card accent">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <span class="title">{{ t.readyTitle }}</span>
+      {% if readiness.ready %}
+      <span class="badge ok">{{ t.readyYes }}</span>
+      {% else %}
+      <span class="badge warn">{{ t.readyNo }}</span>
+      {% endif %}
+    </div>
+    <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:13.5px;color:var(--text-secondary)">
+      <span><strong>{{ readiness.seen | length }}</strong>/{{ readiness.expected }} {{ t.readySeen }}</span>
+      <span><strong>{{ readiness.silent | length }}</strong> {{ t.readySilent }}</span>
+      <span><strong>{{ readiness.denial_total }}</strong> {{ t.readyDenials }}</span>
+      <span class="note">{{ t.readyWindow }}: {{ readiness.window_hours }} h</span>
+    </div>
+    {% if readiness.silent %}
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      {% for tk in readiness.silent %}
+      <span class="chip">{{ tk.prefix }}… {{ tk.email }}{% if tk.label %} · {{ tk.label }}{% endif %}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {% if readiness.denials %}
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      {% for d in readiness.denials %}
+      <span class="badge mono danger">{{ d.reason }} × {{ d.count }}</span>
+      {% endfor %}
+    </div>
+    {% endif %}
+    <p class="note">{{ t.readyNote }}</p>
+  </div>
+  {% endif %}
+
+  {% if new_user_open %}
+  <form class="card accent" method="post" action="/users">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <span class="title">{{ t.newUser }}</span>
+    <div class="inline-form">
+      <input type="text" name="display_name" placeholder="{{ t.nuNamePh }}" maxlength="200" required>
+      <input class="wide" type="email" name="email" placeholder="{{ t.nuEmailPh }}" maxlength="254" required>
+      <button class="btn" type="submit">{{ t.create }}</button>
+    </div>
+    {% if error %}
+    <p class="form-error"><span class="dot"></span>{{ error }}</p>
+    {% endif %}
+    <p class="note">{{ t.nuNote }}</p>
+  </form>
+  {% endif %}
+
+  <div class="card table">
+    <div class="head cols-users">
+      <span>{{ t.colUser }}</span><span>{{ t.colTokens }}</span>
+      <span>{{ t.colStatus }}</span><span>{{ t.colLast }}</span>
+    </div>
+    {% for u in users %}
+    {% set hue = avatar_hue(u.email) %}
+    <a class="row cols-users" href="/users/{{ u.id }}">
+      <div class="who-cell">
+        <div class="avatar {{ 'off' if u.disabled_at }}"
+             style="background:oklch(0.92 0.04 {{ hue }});color:oklch(0.4 0.13 {{ hue }})">
+          {{ initials(u.display_name or u.email) }}
+        </div>
+        <div class="txt">
+          <span class="n">{{ u.display_name or u.email }}</span>
+          <span class="e">{{ u.email }}</span>
+        </div>
+      </div>
+      <span class="cell strong">
+        {{ u.active_tokens }}{% if u.inactive_tokens %} (+{{ u.inactive_tokens }}){% endif %}
+      </span>
+      {% if u.disabled_at %}
+      <span class="badge danger">{{ t.disabled }}</span>
+      {% else %}
+      <span class="badge ok">{{ t.active }}</span>
+      {% endif %}
+      <span class="cell">{{ humanize(u.last_used_at, lang) }}</span>
+    </a>
+    {% else %}
+    <div class="empty">{{ t.noUsers }}</div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

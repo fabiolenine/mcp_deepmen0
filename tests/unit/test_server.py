@@ -168,6 +168,41 @@ class TestSearchMemories:
         _, kwargs = mem.search.call_args
         assert "as_of" not in kwargs
 
+    def test_event_window_forwarded_on_deepmem0_runtime(self, server_with_mock):
+        import mem0 as _m0
+
+        srv, mem = server_with_mock
+        fn = _get_tool_fn(srv, "search_memories")
+        result = fn(query="q", event_from="2023-10", event_to="2023-10", rerank=False)
+        if getattr(_m0, "__deepmem0__", False):
+            _, kwargs = mem.search.call_args
+            assert kwargs["event_from"] == "2023-10"
+            assert kwargs["event_to"] == "2023-10"
+        else:
+            assert "event_from" in result and "error" in result
+            mem.search.assert_not_called()
+
+    def test_event_window_one_sided_forwarded(self, server_with_mock):
+        import mem0 as _m0
+
+        srv, mem = server_with_mock
+        fn = _get_tool_fn(srv, "search_memories")
+        result = fn(query="q", event_from="2024", rerank=False)
+        if getattr(_m0, "__deepmem0__", False):
+            _, kwargs = mem.search.call_args
+            assert kwargs["event_from"] == "2024"
+            assert "event_to" not in kwargs
+        else:
+            assert "error" in result
+
+    def test_event_window_omitted_by_default(self, server_with_mock):
+        srv, mem = server_with_mock
+        fn = _get_tool_fn(srv, "search_memories")
+        fn(query="q", rerank=False)
+        _, kwargs = mem.search.call_args
+        assert "event_from" not in kwargs
+        assert "event_to" not in kwargs
+
 
 class TestGetMemories:
     def test_scope_filters(self, server_with_mock):

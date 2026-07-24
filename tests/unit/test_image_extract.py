@@ -47,7 +47,7 @@ class FakeClient:
 def vision_on(monkeypatch):
     monkeypatch.setenv("MEM0_ENABLE_VISION", "true")
     monkeypatch.setenv("MEM0_VLM_MODEL", "qwen3-vl:4b-instruct")
-    monkeypatch.setenv("MEM0_LLM_MODEL", "llama3.1:8b")
+    monkeypatch.setenv("MEM0_LLM_MODEL", "llama3.1:8b:latest")
 
 
 @pytest.fixture
@@ -109,7 +109,7 @@ class TestTranscribe:
 class TestModelSwaps:
     def test_prepare_unloads_extractor(self, vision_on, fake_client):
         ie.prepare_vision()
-        assert fake_client.unloaded == ["llama3.1:8b"]
+        assert fake_client.unloaded == ["llama3.1:8b:latest"]
 
     def test_release_unloads_vlm(self, vision_on, fake_client):
         ie.release_vision()

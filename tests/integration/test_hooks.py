@@ -122,7 +122,7 @@ class TestContextMainIntegration:
 
         stdin_data = json.dumps({
             "session_id": "inttest-ctx",
-            "cwd": "/workspace/testproject",
+            "cwd": "/home/user/testproject",
             "hook_event_name": "startup",
         })
 
@@ -151,7 +151,7 @@ class TestContextMainIntegration:
         """User with no memories gets a clean non-fatal response."""
         stdin_data = json.dumps({
             "session_id": "inttest-empty",
-            "cwd": "/workspace/emptyproject",
+            "cwd": "/home/user/emptyproject",
             "hook_event_name": "startup",
         })
 
@@ -183,7 +183,7 @@ class TestStopMainIntegration:
 
         stdin_data = json.dumps({
             "session_id": "inttest-stop",
-            "cwd": "/workspace/testproject",
+            "cwd": "/home/user/testproject",
             "transcript_path": str(transcript),
         })
 
@@ -241,7 +241,7 @@ class TestStopMainIntegration:
 
         stdin_data = json.dumps({
             "session_id": "inttest-roundtrip",
-            "cwd": "/workspace/testproject",
+            "cwd": "/home/user/testproject",
             "transcript_path": str(transcript),
         })
 

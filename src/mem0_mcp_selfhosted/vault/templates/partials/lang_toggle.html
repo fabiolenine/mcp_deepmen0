@@ -1,0 +1,5 @@
+{# Language toggle: same path, ?lang= sets the cookie on the response. #}
+<div class="lang-toggle">
+  <a href="{{ request.url.path }}?lang=pt" class="{{ 'on' if lang == 'pt' }}">PT</a>
+  <a href="{{ request.url.path }}?lang=en" class="{{ 'on' if lang == 'en' }}">EN</a>
+</div>

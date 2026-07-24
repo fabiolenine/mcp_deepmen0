@@ -1,0 +1,42 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ t.navAudit }}</h1>
+      <p>{{ t.auditNote }}</p>
+    </div>
+  </div>
+
+  <div class="card table">
+    <div class="head cols-audit">
+      <span>{{ t.colWhen }}</span><span>{{ t.colActor }}</span>
+      <span>{{ t.colAction }}</span><span>{{ t.colSubject }}</span>
+    </div>
+    {% for ev in events %}
+    <div class="row cols-audit">
+      <span class="cell">{{ humanize(ev.ts, lang) }}</span>
+      <span class="cell mono">{{ ev.actor_email or '—' }}</span>
+      <span class="badge mono {{ audit_kind(ev.action) }}">{{ ev.action }}</span>
+      <span class="cell strong">
+        {{ ev.subject_type }}#{{ ev.subject_id }}
+        {%- if ev.details %} · {{ ev.details }}{% endif %}
+        {%- if not ev.success %} · ✗{% endif %}
+      </span>
+    </div>
+    {% else %}
+    <div class="empty">{{ t.noAudit }}</div>
+    {% endfor %}
+  </div>
+
+  <div class="pager">
+    {% if offset > 0 %}
+    <a class="btn-ghost btn-small" href="/audit?offset={{ [offset - page_size, 0] | max }}">← {{ t.prev }}</a>
+    {% endif %}
+    {% if offset + page_size < total %}
+    <a class="btn-ghost btn-small" href="/audit?offset={{ offset + page_size }}">{{ t.next }} →</a>
+    {% endif %}
+    <span class="note">{{ offset + 1 }}–{{ [offset + page_size, total] | min }} / {{ total }}</span>
+  </div>
+</div>
+{% endblock %}

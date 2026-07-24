@@ -1,0 +1,23 @@
+{# The one response in the whole service that carries a plaintext token.
+   Closing reloads the user page, so the token is never re-rendered. #}
+<div class="overlay">
+  <div class="modal">
+    <div style="display:flex;flex-direction:column;gap:4px">
+      <h2>{{ t.modalTitle }}</h2>
+      <p class="subject">{{ subject }}</p>
+    </div>
+
+    <div class="token-box">
+      <code id="vault-token">{{ token }}</code>
+      <button type="button" data-copy-target="vault-token"
+              data-copied="{{ t.copied }}" data-manual="{{ t.copyManual }}">{{ t.copy }}</button>
+    </div>
+
+    <div class="warn-box">
+      <span class="dot"></span>
+      <p>{{ t.modalWarn }}</p>
+    </div>
+
+    <a class="btn-ghost" style="text-align:center" href="/users/{{ user_id }}">{{ t.done }}</a>
+  </div>
+</div>

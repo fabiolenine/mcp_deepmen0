@@ -420,7 +420,7 @@ class IngestQueue:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT task_id, status, submitted_at, attempts, started_at, finished_at, "
-                "last_error, result, next_attempt_at FROM ingest_queue WHERE task_id = ?",
+                "last_error, result, next_attempt_at, user_id FROM ingest_queue WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
         if row is None:

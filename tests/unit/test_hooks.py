@@ -107,7 +107,7 @@ class TestContextMain:
     def _make_stdin(self, **overrides):
         data = {
             "session_id": "sess-1",
-            "cwd": "/workspace/myproject",
+            "cwd": "/home/user/myproject",
             "hook_event_name": "startup",
         }
         data.update(overrides)
@@ -344,7 +344,7 @@ class TestStopMain:
     def _make_stdin(self, tmp_path=None, transcript_path="", **overrides):
         data = {
             "session_id": "sess-1",
-            "cwd": "/workspace/myproject",
+            "cwd": "/home/user/myproject",
             "transcript_path": transcript_path,
         }
         data.update(overrides)
@@ -450,7 +450,7 @@ class TestStopMain:
 
         stdin_data = json.dumps({
             "session_id": "sess-1",
-            "cwd": "/workspace/proj",
+            "cwd": "/home/user/proj",
             "transcript_path": "/some/path",
             "stop_hook_active": True,
         })

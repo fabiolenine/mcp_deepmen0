@@ -48,7 +48,7 @@ def _worker(queue, mem, **kw):
 def vision_on(monkeypatch):
     monkeypatch.setenv("MEM0_ENABLE_VISION", "true")
     monkeypatch.setenv("MEM0_VLM_MODEL", "qwen3-vl:4b-instruct")
-    monkeypatch.setenv("MEM0_LLM_MODEL", "llama3.1:8b")
+    monkeypatch.setenv("MEM0_LLM_MODEL", "llama3.1:8b:latest")
 
 
 @pytest.fixture

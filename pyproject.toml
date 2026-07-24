@@ -12,7 +12,9 @@ authors = [
     { name = "elvismdev" },
 ]
 dependencies = [
-    "mcp[cli]>=1.23.0",
+    # pinned: the vault gate wraps streamable_http_app(); a major bump could
+    # change that surface (tests/contract/test_vault_asgi_contract.py guards it)
+    "mcp[cli]>=1.28,<2",
     "mem0ai[graph,llms]>=1.0.3",
     "anthropic>=0.77.0",
     "neo4j>=5.23.1",
@@ -21,28 +23,35 @@ dependencies = [
 
 [project.scripts]
 mem0-mcp-selfhosted = "mem0_mcp_selfhosted:main"
+deepmem0-vault = "mem0_mcp_selfhosted.vault.main:main"
 mem0-hook-context = "mem0_mcp_selfhosted.hooks:context_main"
 mem0-hook-stop = "mem0_mcp_selfhosted.hooks:stop_main"
 mem0-install-hooks = "mem0_mcp_selfhosted.hooks:install_main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mem0_mcp_selfhosted"]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "httpx>=0.27",
 ]
-
-
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/mem0_mcp_selfhosted"]
-
+# UI/service side of the vault. store.py and middleware.py deliberately import
+# stdlib only, so the MCP server authorizes requests without any of this.
+vault = [
+    "starlette>=0.37",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+    "itsdangerous>=2.2",
+    "argon2-cffi>=23.1",
+]
 
 [tool.pytest.ini_options]
 markers = [
     "integration: tests that require live infrastructure (Qdrant, Ollama, Anthropic, Neo4j)",
     "contract: tests that validate mem0ai internal API stability",
 ]
-
 
 [tool.semantic_release]
 version_toml = ["pyproject.toml:project.version"]

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="shell">
+  <aside class="sidebar">
+    <div class="wordmark">
+      <div class="mark"><i><b></b></i></div>
+      <div class="brand-text">
+        <span class="name">DeepMem0</span>
+        <span class="sub">Vault</span>
+      </div>
+    </div>
+
+    <nav>
+      <a href="/" class="{{ 'on' if nav == 'dash' }}">{{ t.navDash }}</a>
+      <a href="/audit" class="{{ 'on' if nav == 'audit' }}">{{ t.navAudit }}</a>
+    </nav>
+
+    <div class="foot">
+      <div class="mode-card">
+        <span class="cap">{{ t.statMode }}</span>
+        <div class="val">
+          <span class="dot {{ auth_mode }}"></span>
+          <span>{{ auth_mode }}</span>
+        </div>
+        <span class="hint">{{ t[mode_hint_key] }}</span>
+        {% if not auth_mode_confirmed %}
+        <span class="hint" style="color:var(--warn-text)">⚠ {{ t.modeUnconfirmed }}</span>
+        {% endif %}
+      </div>
+
+      <div class="admin-card">
+        <div class="avatar sm"
+             style="background:oklch(0.92 0.04 {{ avatar_hue(admin.email) }});color:oklch(0.4 0.13 {{ avatar_hue(admin.email) }})">
+          {{ initials(admin.name or admin.email) }}
+        </div>
+        <div class="who">
+          <span class="n">{{ admin.name or admin.email }}</span>
+          <span class="r">{{ t.adminRole }}</span>
+        </div>
+        <form method="post" action="/logout">
+          <input type="hidden" name="csrf" value="{{ csrf }}">
+          <button type="submit">{{ t.logout }}</button>
+        </form>
+      </div>
+    </div>
+  </aside>
+
+  <main style="min-width:0">
+    <header class="topbar">
+      <span class="crumb">DeepMem0 Vault · {{ request.headers.get('host', '') }}</span>
+      {% include "partials/lang_toggle.html" %}
+    </header>
+    {% block page %}{% endblock %}
+  </main>
+</div>
+<div id="modal-slot">{% block modal %}{% endblock %}</div>
+{% endblock %}

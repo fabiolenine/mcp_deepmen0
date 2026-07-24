@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block body %}
+<div class="login-page">
+  <div class="login-wrap">
+    <div class="wordmark">
+      <div class="mark"><i><b></b></i></div>
+      <div style="display:flex;align-items:baseline;gap:8px">
+        <span class="name">DeepMem0</span>
+        <span class="pill">Vault</span>
+      </div>
+    </div>
+
+    <form class="login-card" method="post" action="/login">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <h1 style="margin:0;font-family:var(--font-display);font-size:19px;font-weight:600;letter-spacing:-0.01em">{{ t.loginTitle }}</h1>
+        <p style="margin:0;font-size:14px;color:var(--text-muted)">{{ t.loginSub }}</p>
+      </div>
+
+      {% if not has_admin %}
+      <div class="warn-box">
+        <span class="dot"></span>
+        <p><strong>{{ t.noAdminTitle }}</strong><br>{{ t.noAdminBody | safe }}</p>
+      </div>
+      {% endif %}
+
+      <label class="field">{{ t.email }}
+        <input type="email" name="email" placeholder="admin@empresa.com" autocomplete="username" required>
+      </label>
+      <label class="field">{{ t.password }}
+        <input type="password" name="password" placeholder="••••••••••" autocomplete="current-password" required>
+      </label>
+
+      {% if error %}
+      <p class="form-error"><span class="dot"></span>{{ error }}</p>
+      {% endif %}
+
+      <button class="btn btn-block" type="submit">{{ t.signIn }}</button>
+    </form>
+
+    <div class="login-foot">
+      <p><span class="dot small shadow"></span>{{ t.lanNote }}</p>
+      {% include "partials/lang_toggle.html" %}
+    </div>
+  </div>
+</div>
+{% endblock %}
