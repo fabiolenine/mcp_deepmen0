@@ -1,6 +1,19 @@
 # CHANGELOG
 
 
+## v0.3.0 (2026-07-24)
+
+### Features
+
+- Event-date-aware ranking (v0.6) + sync to current
+  ([`c0a9767`](https://github.com/fabiolenine/mcp_deepmen0/commit/c0a9767d2487e3a8ebcbf811a853f1a2e3c39bb7))
+
+- v0.6 event-date-aware ranking: search_memories gains event_from/event_to event-time window filter
+  + automatic query-anchor ranking (fusion boost + bounded post-rerank tie-break, decoupled from the
+  ACT-R tie-break) - DeepMem0 Vault: bearer-token auth gate + admin UI (deepmem0-vault) - async
+  ingest queue, document/vision extraction, and related server updates
+
+
 ## v0.2.0 (2026-07-19)
 
 ### Documentation

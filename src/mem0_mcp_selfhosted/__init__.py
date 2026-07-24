@@ -7,7 +7,7 @@ import os
 # events to PostHog when enabled. Must be set before `import mem0`.
 os.environ["MEM0_TELEMETRY"] = "false"
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 def main():
