@@ -5,16 +5,16 @@ into text so it can flow through the exact v0.5a chunk → fact-extraction
 pipeline. Nothing leaves the host: pdftoppm rasterizes locally and the VLM
 runs on the local Ollama GPU.
 
-Model choice (measured on the , an 8GB GPU): ``qwen3-vl:4b-instruct``.
+Model choice (measured on the reference host, 8GB GPU): ``qwen3-vl:4b-instruct``.
 The bare ``qwen3-vl`` is a *thinking* model — it spends its whole token budget
 reasoning and returns an EMPTY transcription; the ``-instruct`` variant
 transcribes faithfully (accurate Portuguese, numbers and acronyms) at ~7s per
 page when it has the GPU to itself.
 
-VRAM reality: the 4B VLM (~2.9GB) and the resident llama3.1:8b extractor
+VRAM reality: the 4B VLM (~2.9GB) and the resident extractor model
 (~5.5GB) do not fit together in 8GB. So a document is processed in two strict
 phases — transcribe ALL pages with the VLM (extractor unloaded), then extract
-facts from ALL text with llama3.1:8b (VLM unloaded) — two model swaps per job,
+facts from ALL text with the extractor model (VLM unloaded) — two model swaps per job,
 not two per page. The worker calls ``prepare_vision``/``release_vision`` to
 force those swaps.
 """
@@ -61,12 +61,20 @@ def _vlm_url() -> str:
     return env("MEM0_VLM_URL") or env("MEM0_LLM_URL") or env("MEM0_OLLAMA_URL") or "http://localhost:11434"
 
 
-def _client():
+def _client(timeout: float | None = None):
+    """Cliente Ollama. `timeout` é aplicado no TRANSPORTE — sem isso ele é inerte.
+
+    O `ollama.Client` repassa kwargs desconhecidos para o `httpx.Client`, e é ali
+    que o timeout tem efeito. Antes, `transcribe_image` calculava `timeout` a
+    partir de `MEM0_VLM_TIMEOUT` e nunca o usava: uma página travada no VLM
+    prendia o worker serial pelo default do httpx, que é sem limite para leitura
+    em streaming. O worker é ÚNICO — uma página presa para a fila inteira.
+    """
     try:
         from ollama import Client
     except ImportError as e:
         raise VisionUnavailable(f"ollama client not installed: {e}") from None
-    return Client(host=_vlm_url())
+    return Client(host=_vlm_url(), timeout=timeout) if timeout else Client(host=_vlm_url())
 
 
 def _unload(model: str) -> None:
@@ -107,7 +115,7 @@ def transcribe_image(image: bytes | str, *, timeout_s: float | None = None) -> s
     # context overflows (prompt alone exceeds it), so raise it explicitly to
     # hold the image + prompt + the transcription tokens
     num_ctx = int(env("MEM0_VLM_NUM_CTX", "8192"))
-    client = _client()
+    client = _client(timeout)
     try:
         resp = client.chat(
             model=_vlm_model(),

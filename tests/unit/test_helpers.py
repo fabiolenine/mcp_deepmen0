@@ -113,30 +113,124 @@ class TestCallWithGraph:
             call_with_graph(None, False, False, lambda: "ok")
 
 
+def _pt(pid):
+    """Minimal stand-in for a Qdrant point."""
+    m = MagicMock()
+    m.id = pid
+    return m
+
+
 class TestSafeBulkDelete:
+    @staticmethod
+    def _draining_store(memory, ids):
+        """A store that actually drains as delete() is called.
+
+        A store mock that keeps returning the same rows is not a realistic
+        stand-in for a paginated delete — it cannot tell "drained" from
+        "looping".
+        """
+        remaining = list(ids)
+
+        def _list(filters=None, top_k=100):
+            return ([_pt(i) for i in remaining[:top_k]],)
+
+        def _delete(mid):
+            remaining.remove(mid)
+            return {"message": "Memory deleted successfully!"}
+
+        memory.vector_store.list.side_effect = _list
+        memory.delete.side_effect = _delete
+        return lambda: remaining
+
     def test_iterates_and_deletes(self):
         memory = MagicMock()
         memory.enable_graph = False
         memory.graph = None
+        self._draining_store(memory, ["id-1", "id-2"])
 
-        # Mock vector_store.list returning items with .id
-        item1 = MagicMock()
-        item1.id = "id-1"
-        item2 = MagicMock()
-        item2.id = "id-2"
-        memory.vector_store.list.return_value = [item1, item2]
+        r = safe_bulk_delete(memory, {"user_id": "testuser"})
 
-        count = safe_bulk_delete(memory, {"user_id": "testuser"})
-
-        assert count == 2
+        assert r.deleted == 2
+        assert r.vector_scope_drained is True
+        assert r.failed_ids == []
         assert memory.delete.call_count == 2
         memory.delete.assert_any_call("id-1")
         memory.delete.assert_any_call("id-2")
 
+    def test_drains_beyond_one_page(self):
+        """The actual production defect: list() defaults to top_k=100, so a
+        250-memory scope reported count=100 and looked successful."""
+        memory = MagicMock()
+        memory.graph = None
+        ids = [f"id-{i}" for i in range(250)]
+        left = self._draining_store(memory, ids)
+
+        r = safe_bulk_delete(memory, {"user_id": "u"}, page_size=100)
+
+        assert r.deleted == 250
+        assert r.vector_scope_drained is True
+        assert left() == []
+
+    def test_top_k_is_always_explicit(self):
+        """Relying on the store default WAS the bug. Pin it."""
+        memory = MagicMock()
+        memory.graph = None
+        seen = []
+
+        def _list(filters=None, top_k=None):
+            seen.append(top_k)
+            return ([],)
+
+        memory.vector_store.list.side_effect = _list
+        safe_bulk_delete(memory, {"user_id": "u"})
+        assert seen and all(k is not None for k in seen), seen
+
+    def test_partial_version_chain_delete_counts_as_failure(self):
+        """memory.delete() deletes a whole version chain and RETURNS a dict on
+        partial failure instead of raising — a non-raising call is not proof of
+        success."""
+        memory = MagicMock()
+        memory.graph = None
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: (
+            [_pt("id-1")],) if not memory.delete.called else ([_pt("id-1")],)
+        memory.delete.return_value = {"message": "Memory partially deleted; retry",
+                                      "deleted": ["v1"], "remaining": ["id-1"]}
+
+        r = safe_bulk_delete(memory, {"user_id": "u"})
+
+        assert r.failed_ids == ["id-1"]
+        assert r.vector_scope_drained is False
+
+    def test_undeletable_row_terminates_and_reports(self):
+        memory = MagicMock()
+        memory.graph = None
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([_pt("id-1")],)
+        memory.delete.side_effect = RuntimeError("nope")
+
+        r = safe_bulk_delete(memory, {"user_id": "u"}, max_pages=50)
+
+        assert r.deleted == 0
+        assert r.failed_ids == ["id-1"]
+        assert r.vector_scope_drained is False
+        assert memory.delete.call_count == 1, "must not retry the same id forever"
+
+    def test_graph_cleanup_skipped_when_scope_not_drained(self):
+        """Cleaning the graph after a PARTIAL delete would remove graph data for
+        memories that are still alive."""
+        memory = MagicMock()
+        memory.graph = MagicMock()
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([_pt("id-1")],)
+        memory.delete.side_effect = RuntimeError("nope")
+
+        r = safe_bulk_delete(memory, {"user_id": "u"}, graph_enabled=True)
+
+        assert r.vector_scope_drained is False
+        memory.graph.delete_all.assert_not_called()
+
     def test_graph_cleanup_when_graph_enabled_true(self):
         memory = MagicMock()
         memory.graph = MagicMock()
-        memory.vector_store.list.return_value = []
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([],)
 
         safe_bulk_delete(memory, {"user_id": "testuser"}, graph_enabled=True)
 
@@ -145,7 +239,7 @@ class TestSafeBulkDelete:
     def test_no_graph_cleanup_when_graph_enabled_false(self):
         memory = MagicMock()
         memory.graph = MagicMock()
-        memory.vector_store.list.return_value = []
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([],)
 
         safe_bulk_delete(memory, {"user_id": "testuser"}, graph_enabled=False)
 
@@ -155,11 +249,78 @@ class TestSafeBulkDelete:
         """Default graph_enabled=False skips graph cleanup."""
         memory = MagicMock()
         memory.graph = MagicMock()
-        memory.vector_store.list.return_value = []
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([],)
 
         safe_bulk_delete(memory, {"user_id": "testuser"})
 
         memory.graph.delete_all.assert_not_called()
+
+
+class TestSafeBulkDeleteNormalizesScope:
+    """Defesa em profundidade: escopo não normalizado aqui não vira erro — vira
+    um delete que não casa nada e responde ``deleted: 0`` como sucesso.
+
+    MEDIDO no corpus de produção: um ``user_id`` real casa 1159 pontos; o
+    MESMO com um espaço à esquerda casa 0. O filtro do store é casamento EXATO.
+    """
+
+    @pytest.mark.parametrize("key", ["user_id", "agent_id", "run_id", "actor_id"])
+    def test_padded_scope_is_trimmed_before_it_reaches_the_store(self, key):
+        memory = MagicMock()
+        memory.graph = None
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([],)
+
+        safe_bulk_delete(memory, {key: " alice "})
+
+        assert memory.vector_store.list.call_args.kwargs["filters"] == {key: "alice"}
+
+    def test_integer_scope_is_coerced(self):
+        memory = MagicMock()
+        memory.graph = None
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([],)
+
+        safe_bulk_delete(memory, {"user_id": 42})
+
+        assert memory.vector_store.list.call_args.kwargs["filters"] == {"user_id": "42"}
+
+    @pytest.mark.parametrize("key", ["user_id", "agent_id", "run_id", "actor_id"])
+    @pytest.mark.parametrize("bad", ["a b", "   ", 3.5, True])
+    def test_invalid_scope_raises_instead_of_deleting_nothing_quietly(self, key, bad):
+        memory = MagicMock()
+        memory.graph = None
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([],)
+
+        with pytest.raises(ValueError, match=key):
+            safe_bulk_delete(memory, {key: bad})
+
+        memory.vector_store.list.assert_not_called()
+
+    def test_non_scope_filter_keys_are_left_alone(self):
+        """CONTROLE NEGATIVO: normalizar chave livre quebraria filtro de
+        metadata legítimo — só as chaves de ESCOPO passam pela regra."""
+        memory = MagicMock()
+        memory.graph = None
+        memory.vector_store.list.side_effect = lambda filters=None, top_k=100: ([],)
+
+        safe_bulk_delete(memory, {"user_id": "u", "project": "a b c", "importance": 0.8})
+
+        assert memory.vector_store.list.call_args.kwargs["filters"] == {
+            "user_id": "u",
+            "project": "a b c",
+            "importance": 0.8,
+        }
+
+    def test_valid_scope_still_deletes(self):
+        """CONTROLE NEGATIVO: a normalização não pode impedir o caminho feliz."""
+        memory = MagicMock()
+        memory.enable_graph = False
+        memory.graph = None
+        TestSafeBulkDelete._draining_store(memory, ["id-1", "id-2"])
+
+        r = safe_bulk_delete(memory, {"user_id": " testuser "})
+
+        assert r.deleted == 2
+        assert r.vector_scope_drained is True
 
 
 class TestGetDefaultUserId:

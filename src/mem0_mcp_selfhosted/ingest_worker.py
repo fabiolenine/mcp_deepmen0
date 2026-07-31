@@ -297,7 +297,8 @@ class IngestWorker:
                 task_id, "Memory not initialized (infrastructure unavailable)",
                 retryable=True, max_attempts=self.max_attempts, backoff_base_s=self.backoff_base_s,
             )
-            _observe({"event": "ingest_failed", "task_id": task_id, "status": status, "error": "memory_init"})
+            _observe({"event": "ingest_failed", "task_id": task_id, "status": status,
+                      "kind": job.get("kind", "conversation"), "retryable": True, "error": "memory_init"})
             return
 
         idle_for = time.monotonic() - self._last_job_finished
@@ -305,13 +306,29 @@ class IngestWorker:
             if bool_env("MEM0_QUEUE_WARMUP", "true"):
                 _warmup_ollama()
 
+        kind = job.get("kind", "conversation")
+        # DeepMem0 item #8: instrumentar RE-EXECUÇÃO de documento (retry-por-exceção OU
+        # crash+recover_orphans, que volta com attempts=0) ANTES do purge.
+        # chunks_done_before_start>0 = chunks já commitados prestes a serem REPROCESSADOS —
+        # o custo que o resume eliminaria; é o GATILHO do item #8. Pura instrumentação
+        # (não muda o comportamento; segue reprocesso total hoje).
+        if kind == "document":
+            try:
+                _prior = json.loads(job.get("result") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                _prior = {}
+            _k = int(_prior.get("chunks_done") or 0)
+            if _k > 0 or job.get("attempts", 0) > 0:
+                _observe({"event": "doc_reexecution", "task_id": task_id, "kind": "document",
+                          "attempts": job.get("attempts", 0), "chunks_done_before_start": _k,
+                          "chunks_total": _prior.get("chunks_total")})
+
         # Unconditional: a crash on the FIRST attempt leaves orphaned points but
         # recover_orphans() resets the job without bumping attempts — gating on
         # attempts>0 would reprocess without cleanup (mass duplication for
         # multi-chunk document jobs). With no prior points this is a cheap no-op.
         _purge_task_points(mem, task_id, created_at=job.get("submitted_at"))
 
-        kind = job.get("kind", "conversation")
         if kind == "document":
             self._process_document(mem, job, t0)
         elif kind == "update":
@@ -388,12 +405,24 @@ class IngestWorker:
 
     def _process_update(self, mem: Any, job: dict[str, Any], t0: float) -> None:
         """Apply an async ``update_memory`` job: re-embed + re-index the memory and
-        (via the classifier patch) re-classify its metadata — the slow llama3.1:8b call
+        (via the classifier patch) re-classify its metadata — the slow local-LLM call
         that used to time out synchronous callers now runs here in the background.
 
-        The target keeps its ORIGINAL created_at (mem0's update preserves it), so the
-        unconditional purge-on-retry (which matches created_at == submitted_at) spares
-        it, and a retry simply re-applies the same text idempotently.
+        DeepMem0 v0.7 (versioned update): when temporality + ``version_on_update``
+        are on, the fork's ``update`` mints a NEW current version and supersedes the
+        prior head, returning ``{"id": new_id, "old_id": ...}``. We stamp the new
+        version with ``created_at = submitted_at`` (canonical record-time) AND the
+        job's ``task_id`` — so the unconditional purge-on-retry (task_id +
+        created_at == submitted_at) removes a half-created version on a crash retry,
+        and the fork's resolve-to-head + overwrite-marking then re-version cleanly
+        (no duplicates, no branching). A crash between mint and mark_done leaves only
+        the purged version's history/entity rows behind (benign: the point is gone,
+        so it never enters a candidate pool); the fork's own compensation path
+        (a raised transition error) deletes cleanly with no residue.
+
+        When versioning is off, ``update`` stays in-place — the fork preserves the
+        original created_at regardless of the metadata passed — and id == old_id, so
+        the event stays a plain UPDATE. ``submitted_at`` in metadata is inert there.
         """
         task_id = job["task_id"]
         params = job.get("params") or {}
@@ -403,9 +432,13 @@ class IngestWorker:
             self._fail(job, ValueError("update job missing memory_id/text in params"), t0)
             return
 
-        # task_id is provenance only; do NOT stamp created_at (see docstring).
+        submitted_at = job.get("submitted_at")
+
         def _do_update():
-            return mem.update(memory_id, data=text, metadata={"task_id": task_id})
+            return mem.update(
+                memory_id, data=text,
+                metadata={"task_id": task_id, "created_at": submitted_at},
+            )
 
         try:
             if self.call_with_graph is not None:
@@ -418,14 +451,23 @@ class IngestWorker:
             self._fail(job, e, t0)
             return
 
+        new_id = raw.get("id", memory_id) if isinstance(raw, dict) else memory_id
+        old_id = raw.get("old_id", memory_id) if isinstance(raw, dict) else memory_id
+        if new_id != old_id:
+            events = [
+                {"id": old_id, "event": "SUPERSEDED", "superseded_by": new_id},
+                {"id": new_id, "event": "ADD"},
+            ]
+        else:
+            events = [{"id": new_id, "event": "UPDATE"}]
         result = {
-            "memory_ids": [memory_id],
-            "events": [{"id": memory_id, "event": "UPDATE"}],
+            "memory_ids": [new_id],
+            "events": events,
             "processed_at": datetime.now(timezone.utc).isoformat(),
         }
         self.queue.mark_done(task_id, result)
         duration_ms = int((time.monotonic() - t0) * 1000)
-        logger.info("Update job %s done in %dms (memory_id=%s)", task_id, duration_ms, memory_id)
+        logger.info("Update job %s done in %dms (memory_id=%s -> %s)", task_id, duration_ms, old_id, new_id)
         _observe({
             "event": "ingest_done", "task_id": task_id, "kind": "update",
             "duration_ms": duration_ms, "memory_count": 1, "queue_depth": _safe_depth(self.queue),
@@ -438,7 +480,7 @@ class IngestWorker:
 
         Digital PDF pages come from poppler; scanned pages and standalone
         images go through the VLM (v0.5b) when vision is on. All VLM work is
-        confined here — strictly before the llama3.1:8b add-loop — so the GPU
+        confined here — strictly before the extractor add-loop — so the GPU
         holds one model at a time (prepare/release force the two swaps).
         """
         spool_path = params.get("spool_path") or ""

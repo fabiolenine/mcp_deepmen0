@@ -1,6 +1,6 @@
 """Pins _estimate_wait_s defaults + arithmetic.
 
-The recalibrated defaults (ADD 180 / CHUNK 120 / UPDATE 200,  jul/2026) are
+The recalibrated defaults (ADD 180 / CHUNK 120 / UPDATE 200, reference host, jul/2026) are
 UX contract: they must rarely UNDERSHOOT (an undershoot makes MCP clients retry —
 that nearly caused a duplicate add once). The old suite only tested values via
 explicit setenv, so a bad default would have shipped silently. These lock the

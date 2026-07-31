@@ -34,6 +34,14 @@ from typing import Any, Iterator
 
 logger = logging.getLogger(__name__)
 
+#: ⚠️ AO MUDAR ESTE NÚMERO: reinicie os DOIS serviços na mesma janela.
+#: O cofre (:8080) e o gate do MCP (:8081) compartilham este arquivo. Se só um
+#: reiniciar, ele migra o banco e o outro passa a ver uma versão futura ->
+#: SchemaIncompatible -> em MEM0_REQUIRE_AUTH=on isso é fail-closed e TODOS os
+#: clientes tomam 401. O detalhe cruel: o serviço não reiniciado continua
+#: funcionando pelo handle já aberto, então o estado quebrado fica INVISÍVEL
+#: até o próximo restart. Aconteceu em 20/07/2026; o monitor diário
+#: (caddy/check-cert-expiry.sh) passou a detectar via /health.
 SCHEMA_VERSION = 4
 
 TOKEN_PREFIX = "dm0_"

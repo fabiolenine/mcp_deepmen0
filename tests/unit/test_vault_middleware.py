@@ -35,7 +35,7 @@ def make_scope(*, path="/mcp", headers=None, method="POST", type="http"):
         "type": type,
         "method": method,
         "path": path,
-        "client": ("10.0.0.150", 51234),
+        "client": ("203.0.113.50", 51234),
         "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or [])],
     }
 
@@ -431,30 +431,30 @@ class TestBehindAReverseProxy:
 
     async def test_trusted_proxy_hands_over_the_real_client_ip(self, app, vault):
         stack = self.behind_proxy(gate(app, vault, mw.MODE_SHADOW))
-        scope = make_scope(headers=[("x-forwarded-for", "10.0.0.77")])
+        scope = make_scope(headers=[("x-forwarded-for", "203.0.113.77")])
         scope["client"] = ("127.0.0.1", 51000)  # Caddy on loopback
         await call(stack, scope)
-        assert self.last_client(vault) == "10.0.0.77"
+        assert self.last_client(vault) == "203.0.113.77"
 
     async def test_an_untrusted_peer_cannot_forge_its_own_identity(self, app, vault):
         stack = self.behind_proxy(gate(app, vault, mw.MODE_SHADOW))
         scope = make_scope(headers=[("x-forwarded-for", "10.0.0.1")])
-        scope["client"] = ("10.0.0.50", 51000)  # straight from the LAN
+        scope["client"] = ("203.0.113.60", 51000)  # como se viesse da LAN
         await call(stack, scope)
-        assert self.last_client(vault) == "10.0.0.50", "XFF from a stranger must be ignored"
+        assert self.last_client(vault) == "203.0.113.60", "XFF from a stranger must be ignored"
 
     async def test_without_a_proxy_nothing_changes(self, app, vault):
         g = gate(app, vault, mw.MODE_SHADOW)
         scope = make_scope(headers=[("x-forwarded-for", "10.0.0.1")])
-        scope["client"] = ("10.0.0.50", 51000)
+        scope["client"] = ("203.0.113.60", 51000)
         await call(g, scope)
-        assert self.last_client(vault) == "10.0.0.50"
+        assert self.last_client(vault) == "203.0.113.60"
 
     async def test_the_gate_still_authorizes_normally_behind_the_proxy(self, app, vault):
         stack = self.behind_proxy(gate(app, vault, mw.MODE_ON))
         scope = make_scope(headers=[
             ("authorization", f"Bearer {vault['token']}"),
-            ("x-forwarded-for", "10.0.0.77"),
+            ("x-forwarded-for", "203.0.113.77"),
         ])
         scope["client"] = ("127.0.0.1", 51000)
         status, body, _ = await call(stack, scope)

@@ -14,9 +14,14 @@ import json
 import logging
 import re
 import threading
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
+from mem0.memory.utils import normalize_scope_id
 from mem0_mcp_selfhosted.env import env
+
+#: Chaves de `filters` que são ESCOPO e por isso passam pela normalização.
+#: As demais (metadata livre, operadores) seguem intocadas.
+_SCOPE_KEYS = ("user_id", "agent_id", "run_id", "actor_id")
 
 logger = logging.getLogger(__name__)
 
@@ -202,41 +207,162 @@ def call_with_graph(
         return func(*args, **kwargs)
 
 
-def safe_bulk_delete(memory: Any, filters: dict[str, Any], *, graph_enabled: bool = False) -> int:
-    """Safely delete all memories matching filters.
+def _point_id(item: Any) -> str:
+    """Memory id out of a Qdrant point / dict / whatever the store returned."""
+    if hasattr(item, "id"):
+        return item.id
+    if isinstance(item, dict):
+        return item.get("id")
+    return str(item)
+
+
+class BulkDeleteResult(NamedTuple):
+    """Outcome of a bulk delete, stated honestly.
+
+    ``vector_scope_drained`` is VERIFIED by a final scan, not inferred from the
+    loop ending. Its absence is what made a half-finished delete look
+    successful: the old helper returned a bare count, and a caller had no way to
+    tell "deleted everything" from "deleted the first page".
+
+    The name is deliberately narrow. It says the VECTOR scope is empty — it does
+    NOT promise that entity links were cleaned or that graph data went with it.
+    Calling that "complete" invited exactly the over-reading this whole exercise
+    is about; ``graph_cleaned`` is reported separately (None = not attempted).
+
+    ``remaining_ids`` is capped at one page, so treat it as a sample; use
+    ``remaining_is_partial`` before quoting the number as a total.
+    """
+
+    targeted: int
+    deleted: int          # ids REQUESTED that succeeded; lower bound on points
+    failed_ids: list[str]
+    remaining_ids: list[str]
+    vector_scope_drained: bool
+    remaining_is_partial: bool = False
+    graph_cleaned: bool | None = None
+
+
+def safe_bulk_delete(
+    memory: Any,
+    filters: dict[str, Any],
+    *,
+    graph_enabled: bool = False,
+    page_size: int = 1000,
+    max_pages: int = 1000,
+) -> BulkDeleteResult:
+    """Delete every memory matching ``filters``.
 
     NEVER calls memory.delete_all() (which triggers vector_store.reset()).
-    Instead: iterate + individual delete + mandatory graph cleanup.
+
+    Two defects this fixes:
+
+    * ``vector_store.list()`` was called with NO ``top_k``, and Qdrant defaults
+      to 100 — so one call deleted at most 100 memories and reported that count
+      as the whole job. That is the real reason a bulk delete once "needed two
+      passes".
+    * ``memory.delete()`` deletes a whole UPDATE-VERSION CHAIN and, on partial
+      failure, RETURNS a dict instead of raising, so a non-raising call was
+      being scored as a success.
+
+      KNOWN LIMITATION, stated rather than papered over: a SUCCESSFUL chain
+      delete returns only ``{"message": "Memory deleted successfully!"}`` — no
+      list of the points it removed. So ``deleted`` counts REQUESTED ids, and a
+      chain of three versions still counts as one. The number is a lower bound
+      on points removed; ``vector_scope_drained`` is the field that actually
+      answers "is the scope empty". Fixing the count properly needs the fork to
+      report the removed ids on success.
+
+    Termination does not rest on "the page came back empty" — a row that fails
+    to delete would be re-listed forever. Each pass must claim at least one id
+    not already attempted, or the loop ends.
 
     Args:
         graph_enabled: Explicit graph state from caller (avoids reading
             mutable ``memory.enable_graph`` which races with ``call_with_graph``).
-
-    Returns the count of deleted memories.
     """
-    # Get all memories matching the filters
-    # Qdrant.list() returns raw scroll result: (records, next_page_offset)
-    result = memory.vector_store.list(filters=filters)
-    memories = result[0] if isinstance(result, tuple) else result
+    # Defesa em profundidade. A decisão de escopo pertence à fronteira da tool,
+    # onde ainda dá para devolver erro acionável ao cliente — mas este helper é
+    # genérico e pode ganhar outro chamador, e um escopo não normalizado aqui
+    # não produz erro nenhum: produz um delete que não casa nada e responde
+    # `deleted: 0` como sucesso. Reusa a regra do core em vez de reimplementá-la;
+    # duas definições de "escopo válido" foi exatamente o que deixou
+    # `importance='high'` entrar no corpus.
+    filters = {
+        k: (normalize_scope_id(v, k) if k in _SCOPE_KEYS else v)
+        for k, v in (filters or {}).items()
+    }
 
-    count = 0
-    for item in memories:
-        # Extract memory_id from the Qdrant point
-        memory_id = item.id if hasattr(item, "id") else item.get("id") if isinstance(item, dict) else str(item)
-        try:
-            memory.delete(memory_id)
-            count += 1
-        except Exception as exc:
-            logger.warning("Failed to delete memory %s: %s", memory_id, exc)
+    attempted: set[str] = set()
+    failed: list[str] = []
+    deleted_ids: set[str] = set()
 
-    # Mandatory graph cleanup — memory.delete() does NOT clean Neo4j (GitHub #3245)
+    for _ in range(max_pages):
+        result = memory.vector_store.list(filters=filters, top_k=page_size)
+        items = result[0] if isinstance(result, tuple) else result
+        fresh = [i for i in items or [] if _point_id(i) not in attempted]
+        if not fresh:
+            break
+        for item in fresh:
+            memory_id = _point_id(item)
+            attempted.add(memory_id)
+            try:
+                res = memory.delete(memory_id)
+            except Exception as exc:
+                logger.warning("Failed to delete memory %s: %s", memory_id, exc)
+                failed.append(memory_id)
+                continue
+            # A PARTIAL version-chain delete reports itself; trust that over the
+            # call merely not raising. (A successful chain reports nothing, so
+            # `deleted` stays a lower bound — see the docstring.)
+            if isinstance(res, dict) and res.get("remaining"):
+                logger.warning("Partial version-chain delete for %s: remaining=%s",
+                               memory_id, res["remaining"])
+                deleted_ids.update(res.get("deleted") or [])
+                failed.append(memory_id)
+                continue
+            if isinstance(res, dict) and res.get("deleted"):
+                deleted_ids.update(res["deleted"])
+            else:
+                deleted_ids.add(memory_id)
+    else:
+        logger.warning("safe_bulk_delete: page cap (%d) reached for %s", max_pages, filters)
+
+    # Verify rather than assume.
+    verify = memory.vector_store.list(filters=filters, top_k=page_size)
+    verify_items = verify[0] if isinstance(verify, tuple) else verify
+    remaining_ids = [_point_id(i) for i in verify_items or []]
+    drained = not remaining_ids
+    # One page only: if it came back full, the true remainder may be larger.
+    remaining_is_partial = len(remaining_ids) >= page_size
+
+    # Mandatory graph cleanup — memory.delete() does NOT clean Neo4j (GitHub #3245).
+    # Only when the scope really drained: running it on a partial delete would
+    # strip graph data belonging to memories that are still alive.
+    graph_cleaned = None
     if graph_enabled and hasattr(memory, "graph") and memory.graph is not None:
-        try:
-            memory.graph.delete_all(filters)
-        except Exception as exc:
-            logger.warning("Graph cleanup failed for filters %s: %s", filters, exc)
+        if drained:
+            try:
+                memory.graph.delete_all(filters)
+                graph_cleaned = True
+            except Exception as exc:
+                graph_cleaned = False
+                logger.warning("Graph cleanup failed for filters %s: %s", filters, exc)
+        else:
+            graph_cleaned = False
+            logger.warning(
+                "Skipping graph cleanup for %s: %d memories still present — "
+                "cleaning now would delete graph data for live memories.",
+                filters, len(remaining_ids))
 
-    return count
+    return BulkDeleteResult(
+        targeted=len(attempted),
+        deleted=len(deleted_ids),
+        failed_ids=failed,
+        remaining_ids=remaining_ids,
+        vector_scope_drained=drained,
+        remaining_is_partial=remaining_is_partial,
+        graph_cleaned=graph_cleaned,
+    )
 
 
 def list_entities_facet(memory: Any) -> dict[str, list[dict]]:
@@ -282,10 +408,34 @@ def _list_entities_scroll_fallback(memory: Any) -> dict[str, list[dict]]:
         "run_id": {},
     }
 
-    # Scroll through all memories in batches
-    # Qdrant.list() returns raw scroll result: (records, next_page_offset)
-    result = memory.vector_store.list(filters={}, limit=500)
-    all_memories = result[0] if isinstance(result, tuple) else result
+    # Real cursor scroll. Two bugs lived here: the kwarg was `limit=500`, but the
+    # signature is `list(filters=None, top_k=100)` — so this raised TypeError the
+    # moment the Facet API failed, i.e. exactly when the fallback was needed. And
+    # renaming it to top_k alone would only trade a crash for silently counting
+    # the first 500 memories and presenting that as the totals.
+    client = getattr(memory.vector_store, "client", None)
+    collection = getattr(memory.vector_store, "collection_name", None)
+    all_memories: list = []
+    if client is not None and collection is not None:
+        offset = None
+        while True:
+            batch, offset = client.scroll(
+                collection_name=collection, with_payload=True,
+                with_vectors=False, limit=500, offset=offset,
+            )
+            all_memories.extend(batch)
+            if offset is None:
+                break
+    else:
+        # No native cursor: take one big page and SAY that it may be truncated,
+        # rather than reporting a partial count as if it were the whole corpus.
+        top_k = 10000
+        result = memory.vector_store.list(filters=None, top_k=top_k)
+        all_memories = result[0] if isinstance(result, tuple) else result
+        if len(all_memories) >= top_k:
+            logger.warning(
+                "Entity listing fallback hit the %d-row cap — counts are TRUNCATED.", top_k)
+
     for item in all_memories:
         payload = item.payload if hasattr(item, "payload") else item
         if isinstance(payload, dict):

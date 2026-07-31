@@ -1,12 +1,10 @@
 # mem0-mcp-selfhosted
 
-> **DeepMem0 companion** — a fork of [`elvismdev/mem0-mcp-selfhosted`](https://github.com/elvismdev/mem0-mcp-selfhosted) (MIT) that adds a durable **async ingestion queue** (record-time contracts), **document ingestion** (digital PDFs via poppler; scanned PDFs and images via a local vision model / OCR), page-aware **chunking with provenance**, a cross-encoder **reranker** with tunable `max_length`, **temporal supersedence**, and a passive **memory_scope** ontology field (v1). 15 MCP tools. Upstream copyright and MIT license preserved in `LICENSE`.
-
 <a href="https://glama.ai/mcp/servers/elvismdev/mem0-mcp-selfhosted"><img width="380" height="200" src="https://glama.ai/mcp/servers/elvismdev/mem0-mcp-selfhosted/badge?v=1" alt="mem0-mcp-selfhosted MCP server" /></a>
 
 Self-hosted [mem0](https://github.com/mem0ai/mem0) MCP server for Claude Code. Run a complete memory server against self-hosted Qdrant + Neo4j + Ollama, with your choice of Anthropic (Claude) or Ollama as the main LLM.
 
-Uses the `mem0ai` package directly as a library, supports both Claude's OAT token and fully local Ollama setups, and exposes 15 MCP tools for full memory management.
+Uses the `mem0ai` package directly as a library, supports both Claude's OAT token and fully local Ollama setups, and exposes 11 MCP tools for full memory management.
 
 ## Prerequisites
 
@@ -360,6 +358,81 @@ Benchmark results across 248 test cases: Gemini scores 85.4% on entity extractio
 | `streamable-http` | Modern remote clients | `MEM0_TRANSPORT=streamable-http` |
 
 For remote deployments, MCP SDK >= 1.23.0 enables DNS rebinding protection by default.
+
+## DeepMem0 Vault — client authentication
+
+Anything that can reach `streamable-http` can read every memory. The vault is a
+companion service that issues bearer tokens for the MCP and gives an admin a UI
+to manage them.
+
+```
+UI admin (deepmem0-vault, :8080) ──writes──┐
+                                            ├── vault.db (SQLite WAL, one absolute path)
+MCP (:8081) ── BearerTokenMiddleware ───────┘  (verify + touch)
+```
+
+**Kill switch — `MEM0_REQUIRE_AUTH`:**
+
+| Mode | Behavior |
+|------|----------|
+| `off` (default) | Delegates without opening the vault. Today's behavior, byte for byte. |
+| `shadow` | Verifies every request, touches `last_used_at` on valid tokens, logs a throttled warning on unauthorized ones — **never blocks**. |
+| `on` | Unauthorized requests get `401` before reaching the MCP session manager. An unreadable vault fails closed. |
+
+A typo (`MEM0_REQUIRE_AUTH=true`) raises at boot instead of silently disabling auth.
+
+**Setup:**
+
+```bash
+pip install -e ".[vault]"                     # UI deps; the gate itself needs none
+export VAULT_SECRET_KEY=$(python -c 'import secrets; print(secrets.token_urlsafe(48))')
+export MEM0_VAULT_DB_PATH=~/.mem0/vault.db    # same path in both services
+deepmem0-vault bootstrap-admin                # explicit, idempotent, never at boot
+deepmem0-vault                                # serve the UI on :8080
+```
+
+Then create a user, issue a token, and point a client at it:
+
+```bash
+claude mcp add --transport http deepmem0 http://localhost:8081/mcp \
+  --header "Authorization: Bearer dm0_..."
+```
+
+**Rules that are enforced, not documented:** the plaintext token appears in
+exactly one HTTP response and is never stored (only `sha256` + a 12-char
+prefix); every mutation and its audit row share one transaction; rotation
+issues a successor and leaves the old token alive for a grace window
+(`VAULT_TOKEN_GRACE_HOURS`, default 24) instead of causing an outage; revocation
+applies to new requests, and every MCP tool call is a new request.
+
+**Promote `shadow` → `on` on positive evidence**, and let the vault decide:
+
+```bash
+deepmem0-vault promotion-check --window-hours 72   # exit 0 = ready, 1 = not
+```
+
+Every ACTIVE token is the inventory — no separate list to keep in sync. The
+check is ready only when each of them authorized inside the window AND no
+request was denied. Silence is not evidence: a token nobody used is
+indistinguishable from a client that would start taking 401s. The same readout
+is a panel on the dashboard. Both read durable counters (`tokens.use_count`,
+the `auth_denials` table), not throttled log lines that vanish on restart.
+
+**Per-tool authorization.** Tokens carry an optional `mem0_user_id`. When set,
+every one of the 15 tools consults it, under a policy declared in
+`TOOL_SCOPE_POLICY` and enforced by a completeness test (tool #16 cannot ship
+without a decision):
+
+| Policy | Tools | With a bound token |
+|---|---|---|
+| `scope-arg` | add_memory, add_document, search_memories, get_memories, delete_all_memories, delete_entities | the binding wins; a different `user_id` is an error |
+| `record-owner` | get_memory, memory_history, update_memory, delete_memory, memory_task_status | the record's owner decides; someone else's id and a nonexistent id give the same answer |
+| `filtered` | list_entities | the enumeration is narrowed to the bound scope |
+| `operator-only` | memory_queue_status, mcp_search_graph, mcp_get_entity | refused — they report on the whole server |
+
+Sessions are bound to the credential that opened them, so a leaked MCP session
+id cannot be reused by a different token. Every token issued today has an empty
+`mem0_user_id`, so all of this is inert until you bind one.
 
 ## Development
 

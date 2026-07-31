@@ -26,7 +26,8 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from mem0_mcp_selfhosted.config import ProviderInfo, build_config
+from mem0.memory.utils import normalize_scope_id
+from mem0_mcp_selfhosted.config import ProviderInfo, build_config, configured_language
 from mem0_mcp_selfhosted.document_source import resolve_and_spool
 from mem0_mcp_selfhosted.env import bool_env, env
 from mem0_mcp_selfhosted.graph_tools import get_entity, search_graph
@@ -46,7 +47,345 @@ from mem0_mcp_selfhosted.pdf_extract import EncryptedPdf, pdf_info
 from mem0_mcp_selfhosted.vault import middleware as vault_middleware
 from mem0_mcp_selfhosted.vault import store as vault_store
 
+
+def _bulk_delete_envelope(result, message: str) -> dict:
+    """Report a bulk delete honestly.
+
+    `count` alone could not distinguish "deleted everything" from "deleted the
+    first page" — the tool used to answer `count: 100` for a 250-memory scope
+    and look successful. `complete` is verified by a final scan; when it is
+    False the caller is told to re-run instead of guessing.
+    """
+    out = {"message": message, "count": result.deleted,
+           "targeted": result.targeted,
+           # Narrow on purpose: the vector scope is empty. It does NOT claim the
+           # entity links or graph went with it — over-reading a single
+           # "complete" flag is the failure mode this whole contract exists for.
+           "vector_scope_drained": result.vector_scope_drained}
+    if result.graph_cleaned is not None:
+        out["graph_cleaned"] = result.graph_cleaned
+    if result.failed_ids:
+        out["failed"] = len(result.failed_ids)
+        out["failed_ids"] = result.failed_ids[:20]
+    if not result.vector_scope_drained:
+        n = len(result.remaining_ids)
+        out["remaining"] = f">={n}" if result.remaining_is_partial else n
+        out["warning"] = (
+            f"scope NOT drained: {'at least ' if result.remaining_is_partial else ''}"
+            f"{n} memories still match the filters — re-run to continue")
+    return out
+
+
+def _load_metadata_contract():
+    """Contrato tipado de metadata — FONTE ÚNICA em mem0_patches/metadata_contract.py.
+
+    Vive fora deste pacote de propósito: o mesmo arquivo é importado pelos patches
+    (sitecustomize), pelos scripts offline e por aqui — foi a DIVERGÊNCIA entre
+    definições de "válido" que deixou importance='high' entrar no corpus.
+    Em produção o PYTHONPATH do unit systemd já inclui mem0_patches; fora dele
+    (testes, checkout do repo) resolve pelo diretório irmão. Falha de resolução
+    LEVANTA no import: enforcement que some em silêncio é o bug original.
+    """
+    try:
+        import metadata_contract as _mc
+        return _mc
+    except ImportError:
+        pass
+    import importlib.util
+    candidate = Path(__file__).resolve().parents[3] / "mem0_patches" / "metadata_contract.py"
+    spec = importlib.util.spec_from_file_location("metadata_contract", candidate)
+    if spec is None or spec.loader is None:
+        raise ImportError(
+            f"metadata_contract não encontrado (nem no PYTHONPATH nem em {candidate}). "
+            "Adicione mem0_patches ao PYTHONPATH — sem ele a validação de metadata "
+            "ficaria desligada em silêncio.")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+metadata_contract = _load_metadata_contract()
+
 logger = logging.getLogger(__name__)
+
+# --- Contrato de MESSAGES na fronteira de escrita -------------------------
+# Espelha MEM0_METADATA_CONTRACT em vocabulário, com UMA diferença deliberada:
+# o modo é resolvido no BOOT, não por requisição. O precedente da metadata chama
+# `metadata_contract.mode()` dentro do validador, então um valor de env inválido
+# só explode na PRIMEIRA ESCRITA — o serviço sobe "saudável" e mente até alguém
+# tentar gravar.
+MESSAGE_CONTRACT_MODES = ("enforce", "warn", "off")
+MESSAGE_CONTRACT_ENV = "MEM0_MESSAGE_CONTRACT"
+# Nasce em "warn": hoje uma mensagem texto+imagem CONSERVA o texto, e estrear em
+# "enforce" converteria isso em erro duro sem auditar chamadores. Promoção só com
+# evidência medida (ver roadmap: contador `pass` + zero `warn_mixed` na janela).
+_message_contract_mode: str = "warn"
+
+
+# --- Proveniência CARIMBADA NO BOOT --------------------------------------
+# `_provenance()` diz que lê "de DENTRO", mas `fork_sha` e os `sha_*` saem de
+# `git rev-parse` e `open().read()` — do DISCO, em tempo de requisição. Medido em
+# 30/07/2026: um processo iniciado 13:32:07Z reportando um commit de 17:41:42Z,
+# 4h mais novo que ele. Um `/health` assim afirmaria que um restart "pegou a
+# mudança" mesmo sem restart nenhum, porque o disco muda sozinho.
+# Isto carimba na CONSTRUÇÃO. Os campos read-at-request continuam em
+# `provenance` (rotulados por lá); estes são do processo.
+_BOOT_PROVENANCE: dict = {}
+
+
+def _stamp_boot_provenance() -> None:
+    """Congela, no boot, o que ESTE processo carregou. Nunca levanta."""
+    import hashlib
+    import subprocess
+
+    out: dict = {"stamped_at": datetime.now(timezone.utc).isoformat()}
+    try:
+        import mem0
+
+        raiz = os.path.dirname(os.path.dirname(os.path.abspath(mem0.__file__)))
+        out["mem0_root"] = raiz
+        try:
+            out["boot_fork_sha"] = subprocess.check_output(
+                ["git", "-C", raiz, "rev-parse", "--short", "HEAD"],
+                text=True, stderr=subprocess.DEVNULL).strip()
+            out["boot_tree_dirty"] = bool(subprocess.check_output(
+                ["git", "-C", raiz, "status", "--porcelain"],
+                text=True, stderr=subprocess.DEVNULL).strip())
+        except Exception:
+            out["boot_fork_sha"] = None
+            out["boot_tree_dirty"] = None
+        # TODOS os hashes que `_provenance()` publica, não só main.py: um
+        # carimbo parcial deixa o resto seguindo o disco sob nome de processo.
+        # Caminhos IDÊNTICOS aos que `_provenance()` usa. Eu tinha escrito
+        # "mem0/memory/entity_extraction.py", que não existe — o arquivo é
+        # `mem0/utils/entity_extraction.py` — e o carimbo saía `null` em
+        # silêncio, justamente no campo criado para acabar com silêncio.
+        for rel in ("mem0/memory/main.py",
+                    "mem0/utils/entity_extraction.py",
+                    "mem0/utils/spacy_models.py"):
+            nome = f"boot_sha_{os.path.basename(rel)}"
+            try:
+                with open(os.path.join(raiz, rel), "rb") as f:
+                    out[nome] = hashlib.sha256(f.read()).hexdigest()[:12]
+            except Exception:
+                out[nome] = None
+    except Exception as exc:
+        out["error"] = str(exc)[:60]
+
+    # ⚠️ O MCP também. Tudo acima identifica o FORK; nada identificava ESTE
+    # pacote, então a sonda respondia "qual core subiu" e ficava muda sobre
+    # "qual servidor subiu" — e é o servidor que decide escopo, autorização e
+    # contrato de resposta. Um deploy do MCP era verificável só pelo
+    # comportamento, o que serve para o smoke de hoje e para nada amanhã.
+    try:
+        raiz_mcp = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        out["mcp_root"] = raiz_mcp
+        try:
+            out["boot_mcp_sha"] = subprocess.check_output(
+                ["git", "-C", raiz_mcp, "rev-parse", "--short", "HEAD"],
+                text=True, stderr=subprocess.DEVNULL).strip()
+            out["boot_mcp_tree_dirty"] = bool(subprocess.check_output(
+                ["git", "-C", raiz_mcp, "status", "--porcelain"],
+                text=True, stderr=subprocess.DEVNULL).strip())
+        except Exception:
+            out["boot_mcp_sha"] = None
+            out["boot_mcp_tree_dirty"] = None
+        for rel in ("server.py", "helpers.py"):
+            nome = f"boot_sha_mcp_{rel}"
+            try:
+                with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       rel), "rb") as f:
+                    out[nome] = hashlib.sha256(f.read()).hexdigest()[:12]
+            except Exception:
+                out[nome] = None
+    except Exception as exc:
+        out["mcp_error"] = str(exc)[:60]
+
+    # `boot_tree_dirty` é o campo que importa para rollback: árvore suja no boot
+    # significa que o processo NÃO corresponde a commit nenhum e é
+    # irreconstituível — não existe last-known-good a apontar.
+    _BOOT_PROVENANCE.clear()
+    _BOOT_PROVENANCE.update(out)
+
+
+_DISK_READ_AT_REQUEST = ("fork_sha", "sha_entity_extraction.py",
+                         "sha_spacy_models.py", "sha_main.py")
+
+
+def _relabel_disk_fields(prov: dict) -> dict:
+    """ACRESCENTA `disk_*` para o que `_provenance()` lê do DISCO por requisição.
+
+    O docstring de `_provenance()` diz "lido de DENTRO", mas estes campos saem de
+    `git rev-parse` e `open().read()` NO MOMENTO DA CHAMADA — seguem o disco, não
+    o processo. Medido: processo de 13:32:07Z reportando commit de 17:41:42Z.
+    Deixá-los só com o nome antigo, ao lado de `boot_provenance`, manteria a
+    leitura enganosa exatamente onde ela induziu erro.
+
+    ADITIVO, não substituto, por duas razões concretas: `fork_sha` é asserido por
+    `tests/unit/test_health_route.py` (contrato publicado da sonda), e esse mesmo
+    arquivo está no stash de outra sessão — renomear quebraria o teste E criaria
+    conflito no `stash pop`. O nome honesto passa a existir; o antigo continua
+    válido e marcado.
+    """
+    out = dict(prov)
+    for k in _DISK_READ_AT_REQUEST:
+        if k in out:
+            out[f"disk_{k}"] = out[k]
+    out["_leitura"] = ("disk_* = lido do disco NESTA requisição (segue o disco, "
+                       "não o processo); veja boot_provenance para o que ESTE "
+                       "processo carregou")
+    out["_deprecado"] = (
+        f"OBSOLETOS, use os equivalentes disk_* ou boot_provenance: "
+        f"{', '.join(_DISK_READ_AT_REQUEST)}. Mantidos porque "
+        f"tests/unit/test_health_route.py os assere como contrato publicado da "
+        f"sonda. NÃO são identidade do processo, apesar do nome: medido um "
+        f"processo iniciado 13:32:07Z reportando um commit feito 17:41:42Z."
+    )
+    return out
+
+
+def _parse_message_contract_mode() -> str:
+    """Resolve o modo UMA vez, no boot. Valor inválido LEVANTA."""
+    m = (env(MESSAGE_CONTRACT_ENV, "") or "warn").strip().lower()
+    if m not in MESSAGE_CONTRACT_MODES:
+        raise ValueError(
+            f"{MESSAGE_CONTRACT_ENV}={m!r} inválido — use um de {list(MESSAGE_CONTRACT_MODES)}")
+    return m
+
+
+def _image_parts_in(content) -> int:
+    """Quantas partes de imagem esta `content` carrega (lista OU dict solto)."""
+    if isinstance(content, list):
+        return sum(1 for p in content
+                   if isinstance(p, dict) and p.get("type") == "image_url")
+    if isinstance(content, dict) and content.get("type") == "image_url":
+        return 1
+    return 0
+
+
+def _text_survives(content) -> bool:
+    """Sobra algo utilizável depois que o core descartar as imagens?
+
+    Espelha exatamente o que `parse_vision_messages` faz com visão desligada:
+    junta as partes `text` e descarta o resto.
+    """
+    if isinstance(content, list):
+        # `isinstance(text, str)` SEM exigir truthy: o core preserva a string
+        # vazia (text_parts=[""] é lista não-vazia, então a mensagem sobrevive
+        # com content=""). Exigir truthy aqui recusaria payload que o core
+        # manteria — divergência medida contra o fork.
+        return any(isinstance(p, dict) and p.get("type") == "text"
+                   and isinstance(p.get("text"), str)
+                   for p in content)
+    return isinstance(content, str) and bool(content)
+
+
+def _observe_message_contract(verdict: str) -> None:
+    """Emite `stage=message_contract` no canal do Patch 6. Best-effort, nunca levanta.
+
+    O `pass` NÃO é ruído: é o contador de LIVENESS. Sem ele, "zero warn_mixed na
+    janela" não distingue "ninguém manda imagem" de "o validador nunca rodou" — e
+    é essa distinção que autoriza a promoção warn -> enforce.
+    """
+    url = env("MEM0_OBSERVE_URL")
+    if not url:
+        return
+    event = {
+        "service": "mem0", "stage": "message_contract",
+        "verdict": verdict, "mode": _message_contract_mode,
+        "_timestamp": int(time.time() * 1_000_000),
+    }
+
+    def _push():
+        try:
+            import requests
+
+            user, pw = env("MEM0_OBSERVE_USER"), env("MEM0_OBSERVE_PASS")
+            requests.post(url, json=[event],
+                          auth=(user, pw) if user else None, timeout=3)
+        except BaseException:
+            pass
+
+    # EM THREAD: isto roda no caminho quente de todo add_memory, e o contrato da
+    # tool é ack imediato. Um POST síncrono de até 3s (OpenObserve lento ou fora
+    # do ar) atrasaria a resposta "queued" pelo tempo do timeout — observabilidade
+    # não pode custar a garantia que ela existe para observar.
+    threading.Thread(target=_push, daemon=True).start()
+
+
+_MESSAGE_CONTRACT_ERROR = (
+    "add_memory não ingere imagens: a parte image_url seria descartada em "
+    "silêncio (a visão do core está desligada). Use add_document(file_path=...) "
+    "para PNG/JPEG/PDF — a transcrição roda no VLM local."
+)
+
+
+def _validate_messages_shape(messages: list[dict] | None) -> str | None:
+    """FRONTEIRA DE ESCRITA: recusa o que evaporaria em silêncio.
+
+    O core (`parse_vision_messages` com `enable_vision=False`) DESCARTA partes de
+    imagem; se a mensagem só tinha imagem, ela some inteira. O cliente recebia
+    `{"status":"queued"}` e nunca ficava sabendo — o submit é o único ponto onde
+    ainda dá para devolver um erro acionável.
+
+    Regra que atravessa os modos, e o porquê da assimetria:
+
+    ========================  enforce   warn                off
+    texto + imagem            recusa    aceita + loga       aceita mudo
+    IMAGEM-SÓ                 recusa    RECUSA              aceita mudo
+
+    Imagem-só é recusada em `warn` porque aceitar ali reproduziria exatamente o
+    bug que este contrato existe para consertar: `queued` para um payload que
+    provadamente vira zero fato.
+
+    Em `off`, NÃO: `off` é o KILL SWITCH do rollout e restaura o comportamento
+    pré-contrato por inteiro. Um kill switch que não desliga não é kill switch —
+    rollback parcial é pior que nenhum, porque quem o aciona num incidente espera
+    o estado anterior e recebe um subconjunto dele. Quem não quer a mentira do
+    ack não põe `off`.
+    """
+    mixed = image_only = 0
+    for msg in (messages or []):
+        if not isinstance(msg, dict):
+            continue  # container malformado é problema do core, não deste contrato
+        if msg.get("role") == "system":
+            continue  # o core repassa system INTOCADA, imagem e tudo
+        content = msg.get("content")
+        n = _image_parts_in(content)
+        if not n:
+            continue
+        if _text_survives(content):
+            mixed += n
+        else:
+            image_only += n
+    if _message_contract_mode == "off":
+        # ANTES de qualquer veredito: com o contrato desligado nada foi avaliado,
+        # e emitir `pass` aqui inflaria o piso de liveness do P7 com tráfego não
+        # verificado — exatamente o motivo de `off` existir no enum. A versão
+        # anterior emitia `pass` para add sem imagem antes de checar o modo.
+        _observe_message_contract("off")
+        return None
+    if not (mixed or image_only):
+        _observe_message_contract("pass")
+        return None
+    if image_only:
+        _observe_message_contract("reject_image_only")
+        return _MESSAGE_CONTRACT_ERROR
+    if _message_contract_mode == "enforce":
+        _observe_message_contract("reject_mixed")
+        return _MESSAGE_CONTRACT_ERROR
+    if _message_contract_mode == "warn":
+        _observe_message_contract("warn_mixed")
+        logger.warning(
+            "message_contract (warn): %d parte(s) image_url serão descartadas pelo "
+            "core; o texto sobrevive. %s", mixed, _MESSAGE_CONTRACT_ERROR)
+    return None
+
+# Instante de início DESTE processo. O harness lia `ActiveEnterTimestamp` do
+# systemd, que prova idade do processo — não qual código ele carregou. Junto com
+# os hashes de _provenance(), isto responde "o restart pegou a mudança?".
+_STARTED_AT = datetime.now(timezone.utc).isoformat()
 
 # --- Globals set during startup ---
 memory = None
@@ -120,16 +459,64 @@ def _effective_user_id(user_id: str | None) -> tuple[str, str | None]:
     different scope gets an error — never a silent redirect to its own data.
     A token with an empty ``mem0_user_id`` (every token in the current phase)
     keeps today's behavior exactly: client value, else MEM0_USER_ID.
+
+    NORMALIZA o valor do cliente, e é o lugar certo para isso porque é o funil
+    ÚNICO de ``user_id``: toda tool escopada passa por aqui. Duas coisas
+    dependem disso:
+
+    * o filtro do vector store é casamento EXATO — `" alice"` não casa `"alice"`
+      e a diferença não vira erro, vira resultado vazio (MEDIDO no corpus:
+      um `user_id` real casa 1159 pontos e o MESMO com espaço à esquerda, 0);
+    * a comparação de vínculo logo abaixo é `!=` sobre a string crua, então um
+      `user_id` com espaço colado seria recusado como "token não pode acessar
+      esse escopo" — mensagem errada para um defeito de digitação.
     """
+    try:
+        user_id = normalize_scope_id(user_id, "user_id")
+    except ValueError as exc:
+        return "", str(exc)
+
     principal = _current_principal()
     bound = (principal or {}).get("mem0_user_id") or ""
-    if not bound:
-        return (user_id or get_default_user_id()), None
-    if user_id and user_id != bound:
-        return "", (
-            f"token is bound to user_id '{bound}' and cannot access '{user_id}'"
-        )
-    return bound, None
+    if bound:
+        if user_id and user_id != bound:
+            return "", (
+                f"token is bound to user_id '{bound}' and cannot access '{user_id}'"
+            )
+        resolvido, origem = bound, "o user_id amarrado ao token"
+    elif user_id:
+        resolvido, origem = user_id, "o argumento da tool"
+    else:
+        resolvido, origem = get_default_user_id(), "MEM0_USER_ID"
+
+    # ⚠️ O valor RESOLVIDO também passa pela regra, não só o do cliente. Os dois
+    # outros caminhos entravam crus: o default vem de `env()`, que apara só as
+    # BORDAS (`MEM0_USER_ID="a b"` chegava como `'a b'`, e `"   "` como `''`,
+    # ambos sem erro); e o valor amarrado ao token vem do cofre, que nunca
+    # aplicou esta regra. Um escopo com espaço interno não casa nada no store e
+    # não vira erro — vira resultado vazio em TODA tool escopada.
+    # Normalizar é idempotente, então re-aplicar sobre o valor do cliente,
+    # que já passou, é no-op.
+    try:
+        resolvido = normalize_scope_id(resolvido, "user_id")
+    except ValueError as exc:
+        return "", f"{exc} (origem: {origem})"
+    return resolvido or "", None
+
+
+def _normalized_scope(agent_id, run_id) -> tuple[str | None, str | None, str | None]:
+    """Normaliza ``agent_id``/``run_id``. Retorna ``(agent_id, run_id, erro)``.
+
+    ``user_id`` não entra aqui: ele tem funil próprio em `_effective_user_id`.
+    Estes dois não têm, e são usados crus para montar o filtro de delete — que
+    é onde escopo errado é mais caro, porque a resposta de um delete que não
+    casou nada é indistinguível de um delete bem-sucedido de um escopo vazio.
+    """
+    try:
+        return (normalize_scope_id(agent_id, "agent_id"),
+                normalize_scope_id(run_id, "run_id"), None)
+    except ValueError as exc:
+        return None, None, str(exc)
 
 
 #: How each tool decides what a request may touch. Every registered tool MUST
@@ -255,11 +642,44 @@ def _validate_scope_metadata(metadata: dict | None) -> str | None:
     return None
 
 
+def _validate_metadata_contract(metadata: dict | None) -> str | None:
+    """FRONTEIRA DE ESCRITA (26/07/2026): valida a metadata do caller antes de
+    qualquer persistência — o submit é o único ponto onde ainda dá para devolver
+    um erro ACIONÁVEL a quem escreveu.
+
+    Cobre o contrato de scope (v1) + os campos TIPADOS
+    (importance/confidence/domain/memory_type/tags). Chave LIVRE continua
+    passando: 940 pontos do corpus usam campos livres (project, subcategory,
+    topic...), restringi-los quebraria o padrão de escrita de quase tudo.
+
+    Por que rejeitar em vez de coagir: coerção silenciosa esconde o bug do
+    caller e foi assim que 17 memórias marcadas "alta importância" viraram as
+    primeiras a sumir de um filtro de alta importância — o erro só apareceu
+    quando o Open WebUI tentou recuperá-las. MEM0_METADATA_CONTRACT=warn aceita
+    e loga; =off desliga todas as camadas.
+    """
+    scope_err = _validate_scope_metadata(metadata)
+    if scope_err:
+        return scope_err
+    try:
+        mode = metadata_contract.mode()
+    except ValueError as exc:  # env com valor inválido: levanta, não vira "off"
+        logger.error("metadata_contract: %s", exc)
+        raise
+    if mode == "off":
+        return None
+    typed_err = metadata_contract.validate(metadata)
+    if typed_err and mode == "warn":
+        logger.warning("metadata_contract (warn): %s", typed_err)
+        return None
+    return typed_err
+
+
 def _estimate_wait_s(queue: IngestQueue) -> int:
     """Kind-aware drain estimate: conversations cost EST_ADD_S each, documents
     cost EST_CHUNK_S per remaining chunk — queue_depth × 40s lies by an order
     of magnitude once a document is in line."""
-    # Defaults recalibrados  por perda ASSIMÉTRICA:
+    # Defaults recalibrados no host de referência (jul/2026) por perda ASSIMÉTRICA:
     # subestimar faz o cliente MCP dar retry (quase gerou add duplicado no passado);
     # superestimar só faz o cliente esperar/pollar. Por isso p75, não p50.
     #  - ADD 180: service time real started->finished p75=184s (n=43, jul/2026;
@@ -385,7 +805,12 @@ def _ensure_memory() -> Any:
 
 def _create_server() -> FastMCP:
     """Create and configure the FastMCP server with all tools and prompts."""
-    global mcp
+    global mcp, _message_contract_mode
+
+    # Resolve o contrato de messages AQUI, não por requisição: valor inválido tem
+    # que derrubar o boot, não a primeira escrita de um cliente desavisado.
+    _message_contract_mode = _parse_message_contract_mode()
+    _stamp_boot_provenance()
 
     host = env("MEM0_HOST", "0.0.0.0")
     port = int(env("MEM0_PORT", "8081"))
@@ -430,6 +855,129 @@ def _register_health(mcp: FastMCP) -> None:
     """
     from starlette.responses import JSONResponse
 
+    def _provenance() -> dict:
+        """O que ESTE processo carregou — não o que está no disco agora.
+
+        O harness de eval rodava `git -C <fork> rev-parse` e chamava aquilo de
+        proveniência. Não é: prova o estado do DISCO no momento em que o harness
+        roda, e não que o serviço importou aquele código, nem que a árvore estava
+        limpa, nem qual modelo spaCy foi carregado. Um restart no meio invalida a
+        conclusão sem deixar rastro.
+
+        Isto é lido de DENTRO: `mem0.__file__` diz de onde o módulo veio, os
+        hashes dizem QUAL versão dos arquivos que importam está em memória, e as
+        collections efetivas dizem em que dados o processo está mexendo.
+
+        Cada campo falha em silêncio para o próprio valor de erro: /health é
+        sonda de saúde e não pode virar 500 por causa de metadados.
+        """
+        import hashlib
+        import subprocess
+
+        out: dict = {"pid": os.getpid(), "started_at": _STARTED_AT}
+        try:
+            import mem0
+            out["mem0_file"] = getattr(mem0, "__file__", None)
+            out["is_deepmem0"] = bool(getattr(mem0, "__deepmem0__", False))
+            raiz = os.path.dirname(os.path.dirname(os.path.abspath(mem0.__file__)))
+            out["mem0_root"] = raiz
+            try:
+                sha = subprocess.check_output(
+                    ["git", "-C", raiz, "rev-parse", "--short", "HEAD"],
+                    text=True, stderr=subprocess.DEVNULL).strip()
+                sujo = subprocess.check_output(
+                    ["git", "-C", raiz, "status", "--porcelain"],
+                    text=True, stderr=subprocess.DEVNULL).strip()
+                out["fork_sha"] = f"{sha}-dirty" if sujo else sha
+            except Exception as exc:
+                out["fork_sha"] = f"erro: {str(exc)[:60]}"
+            # Hash dos arquivos que decidem o vocabulário de entidades: é o que
+            # distingue "o restart pegou a correção" de "não pegou".
+            for rel in ("mem0/utils/entity_extraction.py", "mem0/utils/spacy_models.py",
+                        "mem0/memory/main.py"):
+                try:
+                    with open(os.path.join(raiz, rel), "rb") as f:
+                        out[f"sha_{os.path.basename(rel)}"] = \
+                            hashlib.sha256(f.read()).hexdigest()[:12]
+                except Exception:
+                    out[f"sha_{os.path.basename(rel)}"] = None
+        except Exception as exc:
+            out["mem0_file"] = f"erro: {str(exc)[:60]}"
+
+        # ⚠️ IDIOMA CONFIGURADO, e SEM CARREGAR. Três defeitos na versão que
+        # chamava `get_nlp_full()` sem argumento:
+        #   1. inspecionava o modelo do idioma DEFAULT (inglês) — a sonda dizia
+        #      `en_core_web_sm` enquanto o deployment português rodava, o que
+        #      não responde nada sobre o pipeline que importa;
+        #   2. CARREGAR dispara `spacy.cli.download`, e sonda de readiness que
+        #      toca a rede pendura;
+        #   3. o `except` convertia a falha em METADADO, então readiness nunca
+        #      reprovava por modelo ausente — o oposto do critério.
+        # `entity_pipeline_status(idioma)` só pergunta "está instalado?" e
+        # devolve `degraded`, que a readiness usa para responder 503.
+        # Nasce degradado: se a checagem estourar, o silêncio não pode virar "ok".
+        out["entity_pipeline"] = {"degraded": True, "erro": "não avaliado"}
+        try:
+            from mem0.utils.spacy_models import entity_pipeline_status
+            st = entity_pipeline_status(configured_language())
+            out["entity_pipeline"] = st
+            out["spacy_model"] = st["model"]
+            out["spacy_language"] = st["language"]
+            try:
+                import importlib.metadata as md
+                out["spacy_version"] = md.version("spacy")
+            except Exception:
+                out["spacy_version"] = None
+        except Exception as exc:
+            out["spacy_model"] = f"erro: {str(exc)[:60]}"
+            out["entity_pipeline"] = {"degraded": True, "erro": str(exc)[:80]}
+
+        # Collections EFETIVAS: a de entidades é DERIVADA do nome da principal
+        # (`_entity_collection_name`), não configurável — então tem que ser lida,
+        # não presumida.
+        try:
+            # `memory` global, NÃO `_ensure_memory()`: a sonda de saúde não pode
+            # DISPARAR a inicialização do Memory (Ollama + reranker, dezenas de
+            # segundos) como efeito colateral. Se ainda não inicializou, o valor
+            # honesto é "não inicializado", não uma inicialização forçada.
+            mem = memory
+            if mem is None:
+                out["collection"] = "não inicializado"
+                return out
+            vs = getattr(mem, "vector_store", None)
+            principal = getattr(vs, "collection_name", None)
+            out["collection"] = principal
+            try:
+                from mem0.memory.main import _entity_collection_name
+                out["entity_collection"] = _entity_collection_name(
+                    mem.config.vector_store.provider, principal)
+            except Exception:
+                out["entity_collection"] = f"{principal}_entities" if principal else None
+            out["language"] = getattr(mem.config, "language", None)
+            out["reranker"] = bool(getattr(mem, "reranker", None))
+        except Exception as exc:
+            out["collection"] = f"erro: {str(exc)[:60]}"
+
+        # Sanitiza ANTES de devolver: um valor não-serializável derruba o /health
+        # com 500 no encoder JSON — falha exatamente onde a sonda deveria ser a
+        # coisa mais robusta do serviço. Só tipos primitivos saem daqui.
+        limpo: dict = {}
+        for k, v in out.items():
+            if isinstance(v, (str, int, float, bool, type(None))):
+                limpo[k] = v
+            elif isinstance(v, dict):
+                # `entity_pipeline` é dict e a readiness LÊ o campo `degraded`
+                # dele. Achatar todo não-primitivo em string transformaria a
+                # DECISÃO de readiness em texto, e `bool("False")` é True.
+                limpo[k] = {
+                    ik: (iv if isinstance(iv, (str, int, float, bool, type(None)))
+                         else f"{type(iv).__name__}: {str(iv)[:40]}")
+                    for ik, iv in v.items()
+                }
+            else:
+                limpo[k] = f"{type(v).__name__}: {str(v)[:60]}"
+        return limpo
+
     @mcp.custom_route("/health", methods=["GET"])
     async def health(request):  # noqa: ANN001, ARG001 - starlette signature
         try:
@@ -437,12 +985,27 @@ def _register_health(mcp: FastMCP) -> None:
         except ValueError as exc:
             mode = f"invalid: {exc}"
         vault_db = vault_store.probe(_vault_db_path()) if mode != "off" else "not_required"
-        degraded = mode == "on" and vault_db != "ok"
+        prov = _relabel_disk_fields(_provenance())
+        # ⚠️ READINESS REPROVA por pipeline de entidade degradado. Idioma
+        # configurado sem o modelo dele não é "um pouco pior": o POS fica
+        # inutilizável (verbo português volta PROPN), e a extração de entidade
+        # segue rodando e gravando lixo em silêncio. `pt_core_news_sm` é
+        # DEPENDÊNCIA DE RUNTIME, e a sonda é onde isso vira visível.
+        # `.get(..., True)` fail-closed: campo ausente conta como degradado.
+        pipeline_degradado = bool((prov.get("entity_pipeline") or {}).get("degraded", True))
+        degraded = (mode == "on" and vault_db != "ok") or pipeline_degradado
         return JSONResponse(
             {
                 "status": "degraded" if degraded else "ok",
+                "entity_pipeline": prov.get("entity_pipeline"),
+                # Informativo, NÃO um motivo de degradação: valor inválido derruba
+                # a construção do servidor, e um processo que não constrói não
+                # serve rota nenhuma para reportar o problema.
+                "message_contract": _message_contract_mode,
+                "boot_provenance": dict(_BOOT_PROVENANCE),
                 "auth_mode": mode,
                 "vault_db": vault_db,
+                "provenance": prov,
             },
             status_code=503 if degraded else 200,
         )
@@ -480,9 +1043,15 @@ def _register_tools(mcp: FastMCP) -> None:
         if auth_err:
             return json.dumps({"error": auth_err}, ensure_ascii=False)
 
-        scope_err = _validate_scope_metadata(metadata)
-        if scope_err:
-            return json.dumps({"error": scope_err}, ensure_ascii=False)
+        meta_err = _validate_metadata_contract(metadata)
+        if meta_err:
+            return json.dumps({"error": meta_err}, ensure_ascii=False)
+
+        # ANTES de montar `msgs`, para cobrir os DOIS caminhos (async enfileirado
+        # e síncrono infer=false) com uma checagem só.
+        msg_err = _validate_messages_shape(messages)
+        if msg_err:
+            return json.dumps({"error": msg_err}, ensure_ascii=False)
 
         # Build messages for mem0ai
         if messages:
@@ -587,9 +1156,9 @@ def _register_tools(mcp: FastMCP) -> None:
         if auth_err:
             return json.dumps({"error": auth_err}, ensure_ascii=False)
 
-        scope_err = _validate_scope_metadata(metadata)
-        if scope_err:
-            return json.dumps({"error": scope_err}, ensure_ascii=False)
+        meta_err = _validate_metadata_contract(metadata)
+        if meta_err:
+            return json.dumps({"error": meta_err}, ensure_ascii=False)
 
         def _do_submit():
             queue, worker = _get_ingest()
@@ -682,6 +1251,8 @@ def _register_tools(mcp: FastMCP) -> None:
         as_of: Annotated[str | None, Field(description="Record-time anchor (ISO date or datetime): return what was known/current on that date — memories created later are excluded and facts superseded only after the anchor carry no demotion.")] = None,
         event_from: Annotated[str | None, Field(description="Event-time window start (inclusive). Full or partial ISO date: '2023' = whole year, '2023-10' = whole month, '2023-10-17' = that day. Filters on WHEN the fact happened (event_date), distinct from as_of's record-time. Memories without an event_date are EXCLUDED while the window is active. Either side alone = open interval. When neither event_from/event_to is given, a single date named in the query auto-anchors ranking without excluding anything.")] = None,
         event_to: Annotated[str | None, Field(description="Event-time window end (inclusive), same partial-date expansion as event_from.")] = None,
+        reinforce: Annotated[bool | None, Field(description="Whether this search counts as a re-encounter for the returned memories (ACT-R usage timeline). Defaults to the server's MEM0_REINFORCE_ON_SEARCH. Measurement harnesses MUST pass false: a benchmark that runs its own queries would otherwise reinforce its own expected targets and inflate the metric it exists to protect.")] = None,
+        historical: Annotated[bool | None, Field(description="RECORDAÇÃO HISTÓRICA (v0.10): 'o que eu sabia naquela época'. Requires as_of. A recollection NEVER reinforces the returned memories (even with reinforce=true) and usage-derived activation is fully inert in ranking; results with an explicitly linked newer fact (semantic correction or update version) come flagged has_newer_version=true and the response carries historical_recall.results_with_newer_version. It detects LINKED successors only — not arbitrary newer facts on the same subject. Plain as_of without this flag keeps the default search behavior.")] = None,
     ) -> str:
         """Semantic search across existing memories."""
         uid, auth_err = _effective_user_id(user_id)
@@ -723,6 +1294,13 @@ def _register_tools(mcp: FastMCP) -> None:
             kwargs["memory_type"] = memory_type
         if sort_by_importance is not None:
             kwargs["sort_by_importance"] = sort_by_importance
+        if reinforce is not None:
+            # Repassado EXPLICITAMENTE (nunca via **kwargs, que o core engole em
+            # silêncio): `False` aqui é o que impede um harness de medição de
+            # reforçar os próprios alvos. No runtime upstream o parâmetro não
+            # existe e o T3 também não — omitir é o comportamento correto.
+            if _core_overfetches:
+                kwargs["reinforce"] = reinforce
         if as_of:
             # DeepMem0 v0.3: âncora temporal. No runtime mem0ai upstream o
             # parâmetro não existe — erro claro em vez de TypeError críptico.
@@ -744,6 +1322,15 @@ def _register_tools(mcp: FastMCP) -> None:
                 kwargs["event_from"] = event_from
             if event_to:
                 kwargs["event_to"] = event_to
+        if historical:
+            # DeepMem0 v0.10: caminho EXPLÍCITO de recordação. Validação de
+            # as_of/feature fica no core (fail-fast com mensagem clara).
+            if not _core_overfetches:
+                return json.dumps(
+                    {"error": "historical requer o runtime DeepMem0 >= 0.10 (mem0ai upstream não suporta)"},
+                    ensure_ascii=False,
+                )
+            kwargs["historical"] = True
 
         mem = _ensure_memory()
 
@@ -769,6 +1356,14 @@ def _register_tools(mcp: FastMCP) -> None:
 
         def _do_search():
             res = mem.search(**kwargs)
+            # v0.10 anti-degradação (achado do /critic-results): num runtime
+            # DeepMem0 < 0.10 o kwarg `historical` cai no **kwargs e é ENGOLIDO
+            # — o caller pediria recordação e receberia busca default sem
+            # aviso. O echo `historical_recall` é o recibo do modo: ausente =
+            # runtime sem suporte, erro claro (independe de checagem de versão).
+            if historical and not (isinstance(res, dict) and res.get("historical_recall")):
+                return {"error": "historical requer o runtime DeepMem0 >= 0.10 "
+                                 "(o runtime ativo aceitou a busca mas não executou o modo)"}
             items = res.get("results") if isinstance(res, dict) else res
             if isinstance(items, list):
                 # corta o over-fetch de volta ao limit pedido (pós-rerank/patch 4)
@@ -900,12 +1495,21 @@ def _register_tools(mcp: FastMCP) -> None:
 
         ASYNCHRONOUS by default (when MEM0_ASYNC_INGEST != false): validates the
         memory exists, then returns {"status": "queued", "task_id", ...} immediately
-        while the re-embed + metadata re-classification (a slow llama3.1:8b call) run in
+        while the re-embed + metadata re-classification (a slow local-LLM call) run in
         the background worker — so the call never times out the client. Poll
         memory_task_status(task_id) for the result (memory_id / UPDATE event);
         memory_history(memory_id) shows the old-vs-new diff. An identical re-submit
         while the job is still active returns the same task_id (no double-apply). Set
         MEM0_ASYNC_INGEST=false for the synchronous path.
+
+        DeepMem0 v0.7 (versioned update, when MEM0_VERSION_ON_UPDATE + temporality
+        are on): the update MINTS A NEW CURRENT VERSION and marks the prior one
+        superseded (kept, restorable via search(as_of=<before the edit>)). The result
+        then carries a NEW current id: async → memory_task_status(task_id).memory_ids;
+        sync → the "id" field (with "old_id"). The id you passed becomes the
+        historical version; get_memory on it returns that older version, and search
+        exposes superseded_by/superseded_at so you can follow the chain. Reusing the
+        old id in a later update/delete resolves to the current head (no branching).
         """
         mem = _ensure_memory()
         if mem is None:
@@ -957,8 +1561,17 @@ def _register_tools(mcp: FastMCP) -> None:
             return json.dumps({"error": denied}, ensure_ascii=False)
 
         def _do_update():
-            mem.update(memory_id, data=text)
-            return {"message": "Memory updated successfully!"}
+            res = mem.update(memory_id, data=text)
+            out = {"message": "Memory updated successfully!"}
+            # DeepMem0 v0.7 (versioned update): surface the NEW current id (and the
+            # now-historical old_id) so a synchronous client never loses the handle
+            # to the current version. In-place/legacy updates return id == old_id.
+            if isinstance(res, dict):
+                if res.get("id"):
+                    out["id"] = res["id"]
+                if res.get("old_id"):
+                    out["old_id"] = res["old_id"]
+            return out
 
         return _mem0_call(_do_update)
 
@@ -966,7 +1579,15 @@ def _register_tools(mcp: FastMCP) -> None:
     def delete_memory(
         memory_id: Annotated[str, Field(description="Exact memory UUID to delete.")],
     ) -> str:
-        """Delete a single memory."""
+        """Delete a single memory (and, when update-versioning is on, its whole version chain).
+
+        Returns {"status":"deleted"} on success. On a PARTIAL chain delete (some
+        versions removed, one or more failed) returns
+        {"status":"partial","deleted":[...],"remaining":[...]} — retry delete_memory
+        with ANY id in `remaining` to finish (idempotent: an already-absent id counts
+        as success). `deleted` lists only what THIS call removed. A not-found id
+        returns an error envelope.
+        """
         mem = _ensure_memory()
         if mem is None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
@@ -976,8 +1597,18 @@ def _register_tools(mcp: FastMCP) -> None:
             return json.dumps({"error": denied}, ensure_ascii=False)
 
         def _do_delete():
-            mem.delete(memory_id)
-            return {"message": "Memory deleted successfully!"}
+            # DeepMem0 v0.7.2: surface the REAL outcome, normalized to a stable MCP
+            # schema (decoupled from fork internals). A partial version-chain delete
+            # must NOT report success — the client needs `remaining` to retry.
+            res = mem.delete(memory_id)
+            if isinstance(res, dict) and res.get("remaining"):
+                return {
+                    "status": "partial",
+                    "message": res.get("message", "Memory partially deleted; retry with a remaining id"),
+                    "deleted": res.get("deleted", []),
+                    "remaining": res["remaining"],
+                }
+            return {"status": "deleted", "message": "Memory deleted successfully!"}
 
         return _mem0_call(_do_delete)
 
@@ -994,6 +1625,9 @@ def _register_tools(mcp: FastMCP) -> None:
         uid, auth_err = _effective_user_id(user_id)
         if auth_err:
             return json.dumps({"error": auth_err}, ensure_ascii=False)
+        agent_id, run_id, scope_err = _normalized_scope(agent_id, run_id)
+        if scope_err:
+            return json.dumps({"error": scope_err}, ensure_ascii=False)
         if not any([uid, agent_id, run_id]):
             return json.dumps(
                 {"error": "At least one scope (user_id, agent_id, or run_id) is required."},
@@ -1013,8 +1647,8 @@ def _register_tools(mcp: FastMCP) -> None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
 
         def _do_bulk_delete():
-            count = safe_bulk_delete(mem, filters, graph_enabled=_enable_graph_default)
-            return {"message": f"Deleted {count} memories.", "count": count}
+            r = safe_bulk_delete(mem, filters, graph_enabled=_enable_graph_default)
+            return _bulk_delete_envelope(r, f"Deleted {r.deleted} memories.")
 
         return _mem0_call(_do_bulk_delete)
 
@@ -1064,6 +1698,9 @@ def _register_tools(mcp: FastMCP) -> None:
             user_id, auth_err = _effective_user_id(user_id)
             if auth_err:
                 return json.dumps({"error": auth_err}, ensure_ascii=False)
+        agent_id, run_id, scope_err = _normalized_scope(agent_id, run_id)
+        if scope_err:
+            return json.dumps({"error": scope_err}, ensure_ascii=False)
 
         filters: dict[str, Any] = {}
         if user_id:
@@ -1078,8 +1715,9 @@ def _register_tools(mcp: FastMCP) -> None:
             return json.dumps({"error": "Memory not initialized", "detail": "Infrastructure may be unavailable."}, ensure_ascii=False)
 
         def _do_delete_entity():
-            count = safe_bulk_delete(mem, filters, graph_enabled=_enable_graph_default)
-            return {"message": f"Entity deleted. Removed {count} memories.", "count": count}
+            r = safe_bulk_delete(mem, filters, graph_enabled=_enable_graph_default)
+            return _bulk_delete_envelope(
+                r, f"Entity deleted. Removed {r.deleted} memories.")
 
         return _mem0_call(_do_delete_entity)
 

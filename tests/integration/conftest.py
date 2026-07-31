@@ -40,12 +40,63 @@ pytestmark = pytest.mark.integration
 TEST_COLLECTION = "mem0_integration_test"
 
 
-@pytest.fixture(scope="session")
-def qdrant_url():
-    """Health-check Qdrant REST API; skip entire suite if unreachable."""
-    url = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+def _resolve_qdrant_api_key() -> str | None:
+    """Env, else the repo-root ``.qdrant.env`` — same resolution the offline
+    scripts use (``scripts/qdrant_auth.py``).
+
+    This Qdrant REQUIRES auth (since 2026-07-20). The integration suite was
+    missed when the offline scripts were fixed, so it 401'd at fixture setup
+    for anyone who had not exported the key by hand — which is why nobody
+    noticed that ``safe_bulk_delete``'s return type had changed under it.
+    ``/healthz`` is unauthenticated, so the health check passed and the failure
+    only surfaced deep inside the first real operation.
+    """
+    key = os.environ.get("MEM0_QDRANT_API_KEY")
+    if key:
+        return key
+    # tests/integration/conftest.py -> tests/ -> mem0-mcp-selfhosted/ -> repo root
+    here = os.path.dirname(os.path.abspath(__file__))
+    root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
     try:
-        urllib.request.urlopen(f"{url}/healthz", timeout=3)
+        with open(os.path.join(root, ".qdrant.env"), encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if s.startswith("MEM0_QDRANT_API_KEY="):
+                    val = s.split("=", 1)[1]
+                    if val:
+                        os.environ["MEM0_QDRANT_API_KEY"] = val
+                        return val
+    except OSError:
+        pass
+    return None
+
+
+@pytest.fixture(scope="session")
+def qdrant_api_key():
+    return _resolve_qdrant_api_key()
+
+
+@pytest.fixture(scope="session")
+def qdrant_url(qdrant_api_key):
+    """Health-check Qdrant REST API; skip entire suite if unreachable.
+
+    Probes an AUTHENTICATED endpoint: ``/healthz`` answers without a key, so it
+    would happily green-light a suite that cannot do a single real operation.
+    """
+    url = os.environ.get("MEM0_QDRANT_URL", "http://localhost:6333")
+    req = urllib.request.Request(
+        f"{url}/collections",
+        headers={"api-key": qdrant_api_key} if qdrant_api_key else {},
+    )
+    try:
+        urllib.request.urlopen(req, timeout=3)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            pytest.skip(
+                f"Qdrant at {url} requires an api-key and none was found "
+                "(env MEM0_QDRANT_API_KEY or <repo>/.qdrant.env)"
+            )
+        pytest.skip(f"Qdrant not usable at {url}: {exc}")
     except Exception:
         pytest.skip(f"Qdrant not reachable at {url}")
     return url
@@ -118,15 +169,26 @@ def memory_instance(qdrant_url, ollama_url):
 
     Uses a dedicated test collection, dropped entirely in teardown.
     Conditionally enables graph support when Neo4j is reachable.
-    Anthropic token is only required when MEM0_LLM_PROVIDER=anthropic.
+    Anthropic token is only required when the resolved provider is anthropic.
+
+    ⚠️ O provedor é resolvido com a MESMA precedência de `build_config()`
+    (`MEM0_LLM_PROVIDER` -> `MEM0_PROVIDER` -> "anthropic"). Este fixture
+    ignorava `MEM0_PROVIDER` e fixava "anthropic" na mão, o que é uma SEGUNDA
+    definição de "qual LLM usamos" — e ela divergiu: o deployment roda
+    `MEM0_PROVIDER=ollama`, sem token Anthropic nenhum, então a suíte
+    exercitava um provedor que produção não usa e caía em
+    `429 rate_limit_error` na fase de setup. MEDIDO: 8 falhas com o default
+    antigo; 15 passed / 4 skipped com o provedor real.
     """
-    llm_provider = os.environ.get("MEM0_LLM_PROVIDER", "anthropic")
+    llm_provider = (os.environ.get("MEM0_LLM_PROVIDER")
+                    or os.environ.get("MEM0_PROVIDER")
+                    or "anthropic")
     if llm_provider == "anthropic":
         from mem0_mcp_selfhosted.auth import resolve_token
 
         token = resolve_token()
         if not token:
-            pytest.skip("No Anthropic token available (required for MEM0_LLM_PROVIDER=anthropic)")
+            pytest.skip("No Anthropic token available (resolved provider is anthropic)")
     # Override collection name for test isolation
     original_collection = os.environ.get("MEM0_COLLECTION")
     original_graph = os.environ.get("MEM0_ENABLE_GRAPH")
@@ -158,8 +220,14 @@ def memory_instance(qdrant_url, ollama_url):
     try:
         from qdrant_client import QdrantClient
 
-        client = QdrantClient(url=qdrant_url)
+        client = QdrantClient(url=qdrant_url, api_key=_resolve_qdrant_api_key())
         client.delete_collection(TEST_COLLECTION)
+        # The entity store is a SECOND collection; leaving it behind was how
+        # `*_entities` leftovers accumulated from test runs.
+        try:
+            client.delete_collection(f"{TEST_COLLECTION}_entities")
+        except Exception:
+            pass
     except Exception:
         pass  # Collection may not exist
 

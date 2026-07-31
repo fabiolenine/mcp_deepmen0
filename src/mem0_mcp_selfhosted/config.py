@@ -33,6 +33,32 @@ def _resolve_ollama_url(*env_keys: str) -> str:
     return env("MEM0_OLLAMA_URL") or "http://localhost:11434"
 
 
+#: Stemmer do Snowball -> código ISO. O drop-in systemd em produção configura o
+#: BM25, não o idioma, então a derivação é o caminho REAL na maioria dos boots.
+_SNOWBALL_TO_ISO = {"portuguese": "pt", "english": "en", "spanish": "es",
+                    "french": "fr", "german": "de", "italian": "it"}
+
+
+def configured_language() -> str | None:
+    """Idioma efetivo do corpus, ou ``None`` quando nada foi configurado.
+
+    Existe como função — e não inline no `build_config()` — porque a sonda de
+    readiness precisa da MESMA resposta para dizer qual pipeline de entidade
+    deveria estar carregado. Duas derivações do mesmo idioma divergiriam, e uma
+    sonda que discorda do runtime é pior que sonda nenhuma: ela afirma.
+
+    ``MEM0_LANGUAGE`` (ISO) vence; sem ele, deriva de ``MEM0_BM25_LANGUAGE``,
+    que é o que o drop-in de produção realmente define.
+    """
+    language = opt_env("MEM0_LANGUAGE")
+    if language:
+        return language
+    bm25_lang = (opt_env("MEM0_BM25_LANGUAGE") or "").strip().lower()
+    if bm25_lang:
+        return _SNOWBALL_TO_ISO.get(bm25_lang, bm25_lang)
+    return None
+
+
 def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] | None]:
     """Build mem0ai MemoryConfig dict and provider registration info.
 
@@ -60,7 +86,7 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
             f"Supported: {list(_supported_llm_providers)}"
         )
 
-    _llm_model_defaults = {"anthropic": "claude-opus-4-6", "ollama": "llama3.1:8b"}
+    _llm_model_defaults = {"anthropic": "claude-opus-4-6", "ollama": "qwen3:14b"}
     llm_model = env("MEM0_LLM_MODEL", _llm_model_defaults[llm_provider])
     llm_max_tokens = int(env("MEM0_LLM_MAX_TOKENS", "16384"))
 
@@ -144,19 +170,13 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
     # Patch 8 do sitecustomize ("portuguese" -> "pt"), então o drop-in systemd
     # existente basta. No runtime mem0ai upstream a chave é ignorada (pydantic
     # extra=ignore) e o Patch 8 segue cobrindo o BM25.
-    language = opt_env("MEM0_LANGUAGE")
-    if not language:
-        bm25_lang = (opt_env("MEM0_BM25_LANGUAGE") or "").strip().lower()
-        if bm25_lang:
-            _snowball_to_iso = {"portuguese": "pt", "english": "en", "spanish": "es",
-                                "french": "fr", "german": "de", "italian": "it"}
-            language = _snowball_to_iso.get(bm25_lang, bm25_lang)
+    language = configured_language()
     if language:
         config_dict["language"] = language
 
     # --- Reranker (opt-in via MEM0_ENABLE_RERANK) ---
-    # Cross-encoder em CPU (device="cpu") — 0 VRAM, não compete com o llama3.1:8b na
-    # an 8GB GPU. Reordena o pool recuperado (denso+BM25) por relevância real. Sem a
+    # Cross-encoder em CPU (device="cpu") — 0 VRAM, não compete com o extrator na
+    # GPU de 8GB. Reordena o pool recuperado (denso+BM25) por relevância real. Sem a
     # env, mem0ai deixa self.reranker=None e o param `rerank` da tool vira no-op.
     # Evitar provider "huggingface" (auto-cuda) e "llm" (gera tokens no qwen).
     if bool_env("MEM0_ENABLE_RERANK"):
@@ -196,8 +216,29 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         dynamics_config["decay"] = float(env("MEM0_DYNAMICS_DECAY", "0.5"))
     if opt_env("MEM0_REINFORCEMENT_WINDOW"):
         dynamics_config["reinforcement_window"] = int(env("MEM0_REINFORCEMENT_WINDOW", "3600"))
+    # ⚠️ tie_band NÃO era mapeado: colocá-lo num drop-in era configuração
+    # silenciosamente ignorada — a mesma classe do `Environment=` sem aspas que
+    # descartou o prompt inteiro em 19/07. weight governa SÓ o termo da fusão;
+    # tie_band governa o tie-break pós-rerank. São knobs independentes (é o que
+    # torna possível rodar "só tie-break", com a fusão zerada).
+    if opt_env("MEM0_DYNAMICS_TIE_BAND"):
+        dynamics_config["tie_band"] = float(env("MEM0_DYNAMICS_TIE_BAND", "0.002"))
     if opt_env("MEM0_REINFORCE_ON_SEARCH") is not None:
         dynamics_config["reinforce_on_search"] = bool_env("MEM0_REINFORCE_ON_SEARCH")
+    if opt_env("MEM0_REINFORCE_TOP_N"):
+        dynamics_config["reinforce_top_n"] = int(env("MEM0_REINFORCE_TOP_N", "3"))
+    if opt_env("MEM0_REINFORCE_ON_SEARCH_WINDOW"):
+        dynamics_config["reinforce_on_search_window"] = int(
+            env("MEM0_REINFORCE_ON_SEARCH_WINDOW", "86400"))
+    if opt_env("MEM0_REINFORCE_ON_SIMILAR") is not None:
+        dynamics_config["reinforce_on_similar"] = bool_env("MEM0_REINFORCE_ON_SIMILAR")
+    # O /critic-plan alegou que env "0" seria descartada aqui; VERIFICADO falso:
+    # opt_env devolve a STRING "0", que é truthy — o padrão numérico dos irmãos
+    # mapeia "0" corretamente (e ignora env vazia, que `is not None` converteria
+    # em float("") = crash no boot). Teste de regressão cobre "0" chegando.
+    if opt_env("MEM0_REINFORCE_SIMILARITY_THRESHOLD"):
+        dynamics_config["reinforce_similarity_threshold"] = float(
+            env("MEM0_REINFORCE_SIMILARITY_THRESHOLD", "0.95"))
     if dynamics_config:
         config_dict["dynamics"] = dynamics_config
 
@@ -221,6 +262,15 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         temporality_config["event_window_days"] = int(env("MEM0_EVENT_WINDOW_DAYS", "30"))
     if opt_env("MEM0_EVENT_TIE_BAND"):
         temporality_config["event_tie_band"] = float(env("MEM0_EVENT_TIE_BAND", "0.05"))
+    if opt_env("MEM0_VERSION_ON_UPDATE") is not None:
+        temporality_config["version_on_update"] = bool_env("MEM0_VERSION_ON_UPDATE")
+    # v0.9: herança de ativação no update versionado (cópia + T2 + máscara).
+    if opt_env("MEM0_VERSION_INHERITS_DYNAMICS") is not None:
+        temporality_config["version_inherits_dynamics"] = bool_env(
+            "MEM0_VERSION_INHERITS_DYNAMICS")
+    # v0.10: recordação histórica (search historical=True + as_of).
+    if opt_env("MEM0_HISTORICAL_RECALL") is not None:
+        temporality_config["historical_recall"] = bool_env("MEM0_HISTORICAL_RECALL")
     if temporality_config:
         config_dict["temporality"] = temporality_config
 

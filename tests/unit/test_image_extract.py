@@ -47,13 +47,14 @@ class FakeClient:
 def vision_on(monkeypatch):
     monkeypatch.setenv("MEM0_ENABLE_VISION", "true")
     monkeypatch.setenv("MEM0_VLM_MODEL", "qwen3-vl:4b-instruct")
-    monkeypatch.setenv("MEM0_LLM_MODEL", "llama3.1:8b:latest")
+    monkeypatch.setenv("MEM0_LLM_MODEL", "extractor-model:latest")
 
 
 @pytest.fixture
 def fake_client(monkeypatch):
     client = FakeClient()
-    monkeypatch.setattr(ie, "_client", lambda: client)
+    # tolerante à assinatura: `_client` passou a receber o timeout do transporte
+    monkeypatch.setattr(ie, "_client", lambda *a, **k: client)
     return client
 
 
@@ -97,7 +98,7 @@ class TestTranscribe:
             transcribe_image(PNG)
 
     def test_request_failure_is_infra_not_poison(self, vision_on, monkeypatch):
-        monkeypatch.setattr(ie, "_client", lambda: FakeClient(raises=ConnectionError("ollama down")))
+        monkeypatch.setattr(ie, "_client", lambda *a, **k: FakeClient(raises=ConnectionError("ollama down")))
         # RuntimeError (retryable), NOT VisionError (poison) — infra failures retry
         with pytest.raises(RuntimeError):
             transcribe_image(PNG)
@@ -109,7 +110,7 @@ class TestTranscribe:
 class TestModelSwaps:
     def test_prepare_unloads_extractor(self, vision_on, fake_client):
         ie.prepare_vision()
-        assert fake_client.unloaded == ["llama3.1:8b:latest"]
+        assert fake_client.unloaded == ["extractor-model:latest"]
 
     def test_release_unloads_vlm(self, vision_on, fake_client):
         ie.release_vision()
@@ -119,6 +120,61 @@ class TestModelSwaps:
         class Boom:
             def generate(self, **k):
                 raise RuntimeError("boom")
-        monkeypatch.setattr(ie, "_client", lambda: Boom())
+        monkeypatch.setattr(ie, "_client", lambda *a, **k: Boom())
         ie.prepare_vision()  # must not raise
         ie.release_vision()
+
+
+class TestTimeoutReachesTheTransport:
+    """`MEM0_VLM_TIMEOUT` era calculado e NUNCA aplicado.
+
+    O worker de ingestão é serial e único: uma página travada no VLM prendia a
+    fila inteira pelo default do httpx (sem limite de leitura em streaming).
+    """
+
+    def test_timeout_is_passed_to_the_client(self, monkeypatch):
+        import mem0_mcp_selfhosted.image_extract as ie
+
+        capturado = {}
+
+        class _FakeClient:
+            def __init__(self, host=None, timeout=None):
+                capturado["timeout"] = timeout
+
+            def chat(self, **kw):
+                class _R:
+                    class message:
+                        content = "texto transcrito"
+                return _R()
+
+        monkeypatch.setenv("MEM0_ENABLE_VISION", "true")
+        monkeypatch.setenv("MEM0_VLM_MODEL", "qwen3-vl:4b-instruct")
+        monkeypatch.setenv("MEM0_VLM_TIMEOUT", "42")
+        monkeypatch.setattr(ie, "_client",
+                            lambda t=None: _FakeClient(timeout=t))
+        ie.transcribe_image(b"\x89PNG\r\n\x1a\n")
+        assert capturado["timeout"] == 42.0, (
+            f"timeout não chegou ao transporte: {capturado}"
+        )
+
+    def test_explicit_timeout_s_wins_over_env(self, monkeypatch):
+        import mem0_mcp_selfhosted.image_extract as ie
+
+        capturado = {}
+        monkeypatch.setenv("MEM0_ENABLE_VISION", "true")
+        monkeypatch.setenv("MEM0_VLM_MODEL", "qwen3-vl:4b-instruct")
+        monkeypatch.setenv("MEM0_VLM_TIMEOUT", "300")
+
+        class _FakeClient:
+            def __init__(self, host=None, timeout=None):
+                capturado["timeout"] = timeout
+
+            def chat(self, **kw):
+                class _R:
+                    class message:
+                        content = "ok"
+                return _R()
+
+        monkeypatch.setattr(ie, "_client", lambda t=None: _FakeClient(timeout=t))
+        ie.transcribe_image(b"\x89PNG\r\n\x1a\n", timeout_s=7)
+        assert capturado["timeout"] == 7.0

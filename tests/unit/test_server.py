@@ -282,9 +282,61 @@ class TestDeleteMemory:
         parsed = json.loads(result)
         assert parsed["message"] == "Memory deleted successfully!"
 
+    # --- DeepMem0 v0.7.2 (§A): the wrapper must SURFACE the real outcome ---------
+    def test_full_success_status_deleted(self, server_with_mock):
+        srv, mem = server_with_mock
+        mem.delete.return_value = {"message": "Memory deleted successfully!"}
+        parsed = json.loads(_get_tool_fn(srv, "delete_memory")(memory_id="uuid-1"))
+        assert parsed["status"] == "deleted"
+        assert "remaining" not in parsed
+
+    def test_non_dict_return_defaults_to_deleted(self, server_with_mock):
+        srv, mem = server_with_mock
+        mem.delete.return_value = None  # legacy/None return
+        parsed = json.loads(_get_tool_fn(srv, "delete_memory")(memory_id="uuid-1"))
+        assert parsed["status"] == "deleted"
+
+    def test_partial_delete_surfaces_remaining(self, server_with_mock):
+        srv, mem = server_with_mock
+        mem.delete.return_value = {
+            "message": "Memory partially deleted; retry with a remaining id",
+            "deleted": ["v1"],
+            "remaining": ["v2", "v3"],
+        }
+        parsed = json.loads(_get_tool_fn(srv, "delete_memory")(memory_id="v1"))
+        assert parsed["status"] == "partial"
+        assert parsed["deleted"] == ["v1"]
+        assert parsed["remaining"] == ["v2", "v3"]
+
+    def test_not_found_returns_error_envelope(self, server_with_mock):
+        srv, mem = server_with_mock
+        mem.delete.side_effect = ValueError("Memory with id ghost not found")
+        parsed = json.loads(_get_tool_fn(srv, "delete_memory")(memory_id="ghost"))
+        assert "error" in parsed
+        assert "status" not in parsed  # not a success/partial envelope
+
+    @patch("mem0_mcp_selfhosted.server._authorize_memory_id", return_value="not your memory")
+    def test_authz_denial_short_circuits(self, _mock_authz, server_with_mock):
+        srv, mem = server_with_mock
+        parsed = json.loads(_get_tool_fn(srv, "delete_memory")(memory_id="someone-elses"))
+        assert parsed["error"] == "not your memory"
+        mem.delete.assert_not_called()
+
+
+def _bulk_result(deleted=0, targeted=None, failed=(), remaining=(), complete=None):
+    from mem0_mcp_selfhosted.helpers import BulkDeleteResult
+
+    return BulkDeleteResult(
+        targeted=deleted if targeted is None else targeted,
+        deleted=deleted,
+        failed_ids=list(failed),
+        remaining_ids=list(remaining),
+        vector_scope_drained=(not remaining) if complete is None else complete,
+    )
+
 
 class TestDeleteAllMemories:
-    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=0)
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=_bulk_result(0))
     def test_scope_defaults_to_user_id(self, mock_sbd, server_with_mock):
         """delete_all_memories always falls back to get_default_user_id(),
         so uid is always truthy.  Verify the default user scope is used."""
@@ -295,7 +347,7 @@ class TestDeleteAllMemories:
         parsed = json.loads(result)
         assert parsed["count"] == 0
 
-    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=3)
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=_bulk_result(3))
     def test_delegates_safe_bulk_delete(self, mock_sbd, server_with_mock):
         srv, mem = server_with_mock
         fn = _get_tool_fn(srv, "delete_all_memories")
@@ -303,6 +355,164 @@ class TestDeleteAllMemories:
         mock_sbd.assert_called_once_with(mem, {"user_id": "alice"}, graph_enabled=False)
         parsed = json.loads(result)
         assert parsed["count"] == 3
+        assert parsed["vector_scope_drained"] is True
+
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete",
+           return_value=_bulk_result(100, targeted=100, remaining=[f"m{i}" for i in range(150)]))
+    def test_incomplete_delete_is_reported_not_hidden(self, mock_sbd, server_with_mock):
+        """The defect this contract exists for: the tool used to answer
+        `count: 100` for a 250-memory scope and read as success."""
+        srv, mem = server_with_mock
+        parsed = json.loads(_get_tool_fn(srv, "delete_all_memories")(user_id="alice"))
+        assert parsed["count"] == 100
+        assert parsed["vector_scope_drained"] is False
+        assert parsed["remaining"] == 150
+        assert "re-run" in parsed["warning"]
+
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete",
+           return_value=_bulk_result(2, targeted=3, failed=["bad-1"]))
+    def test_failures_are_surfaced(self, mock_sbd, server_with_mock):
+        srv, mem = server_with_mock
+        parsed = json.loads(_get_tool_fn(srv, "delete_all_memories")(user_id="alice"))
+        assert parsed["failed"] == 1
+        assert parsed["failed_ids"] == ["bad-1"]
+
+
+class TestDeleteScopeNormalization:
+    """A fronteira normaliza o escopo ANTES de montar o filtro.
+
+    Um escopo com espaço colado não casa nada no store e o delete responde
+    sucesso tendo apagado zero — não há resultado vazio para alguém estranhar.
+    MEDIDO no corpus: um ``user_id`` real casa 1159 pontos; o MESMO valor com
+    um espaço à esquerda casa 0.
+    """
+
+    @pytest.mark.parametrize("tool", ["delete_all_memories", "delete_entities"])
+    @pytest.mark.parametrize("key", ["user_id", "agent_id", "run_id"])
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=_bulk_result(0))
+    def test_padded_scope_is_trimmed(self, mock_sbd, server_with_mock, tool, key):
+        srv, mem = server_with_mock
+        _get_tool_fn(srv, tool)(**{key: " alice "})
+
+        entregue = mock_sbd.call_args.args[1]
+        assert entregue[key] == "alice", f"{tool}/{key} entregou {entregue!r}"
+
+    @pytest.mark.parametrize("tool", ["delete_all_memories", "delete_entities"])
+    @pytest.mark.parametrize(
+        "key,bad,fragment",
+        [
+            ("user_id", "a b", "cannot contain whitespace"),
+            ("agent_id", "a b", "cannot contain whitespace"),
+            ("run_id", "a b", "cannot contain whitespace"),
+            ("agent_id", "   ", "cannot be empty or whitespace-only"),
+        ],
+    )
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=_bulk_result(0))
+    def test_invalid_scope_is_an_actionable_error_not_a_silent_noop(
+        self, mock_sbd, server_with_mock, tool, key, bad, fragment
+    ):
+        srv, mem = server_with_mock
+        parsed = json.loads(_get_tool_fn(srv, tool)(**{key: bad}))
+
+        assert fragment in parsed["error"]
+        assert key in parsed["error"]
+        # Tem que falhar ANTES de deletar: uma guarda que roda depois do delete
+        # não protege nada.
+        mock_sbd.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["delete_all_memories", "delete_entities"])
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=_bulk_result(3))
+    def test_valid_scope_still_deletes(self, mock_sbd, server_with_mock, tool):
+        """CONTROLE NEGATIVO: a validação não pode quebrar o caminho feliz."""
+        srv, mem = server_with_mock
+        parsed = json.loads(_get_tool_fn(srv, tool)(user_id="alice"))
+
+        assert mock_sbd.call_args.args[1]["user_id"] == "alice"
+        assert parsed["count"] == 3
+
+
+class TestEffectiveUserIdNormalizesEveryOrigin:
+    """O escopo RESOLVIDO passa pela regra, não só o argumento do cliente.
+
+    Os outros dois caminhos entravam crus. `get_default_user_id()` usa `env()`,
+    que apara só as BORDAS: `MEM0_USER_ID="a b"` chegava como `'a b'` e `"   "`
+    como `''`, os dois sem erro nenhum, em TODA tool escopada. E o `user_id`
+    amarrado ao token vem do cofre, que nunca aplicou esta regra.
+    """
+
+    @pytest.mark.parametrize(
+        "valor,esperado",
+        [("alice", "alice"), ("  alice  ", "alice")],
+    )
+    def test_default_valido_resolve(self, monkeypatch, valor, esperado):
+        monkeypatch.setenv("MEM0_USER_ID", valor)
+        uid, err = server_mod._effective_user_id(None)
+        assert (uid, err) == (esperado, None)
+
+    @pytest.mark.parametrize(
+        "valor,fragmento",
+        [
+            ("a b", "cannot contain whitespace"),
+            ("alice\tx", "cannot contain whitespace"),
+            ("   ", "cannot be empty or whitespace-only"),
+        ],
+    )
+    def test_default_invalido_vira_erro_com_a_origem(self, monkeypatch, valor, fragmento):
+        monkeypatch.setenv("MEM0_USER_ID", valor)
+
+        uid, err = server_mod._effective_user_id(None)
+
+        assert uid == ""
+        assert fragmento in err
+        # A origem é o que torna o erro acionável: sem ela o operador procura
+        # o defeito no cliente, e ele está no drop-in do systemd.
+        assert "MEM0_USER_ID" in err
+
+    def test_valor_amarrado_ao_token_tambem_normaliza(self, monkeypatch):
+        monkeypatch.setattr(server_mod, "_current_principal",
+                            lambda: {"mem0_user_id": "  alice  "})
+
+        uid, err = server_mod._effective_user_id(None)
+
+        assert (uid, err) == ("alice", None)
+
+    def test_valor_amarrado_invalido_vira_erro_com_a_origem(self, monkeypatch):
+        monkeypatch.setattr(server_mod, "_current_principal",
+                            lambda: {"mem0_user_id": "a b"})
+
+        uid, err = server_mod._effective_user_id(None)
+
+        assert uid == ""
+        assert "cannot contain whitespace" in err
+        assert "token" in err
+
+
+class TestBootProvenanceCoversTheMcp:
+    """A sonda identificava só o FORK. É o servidor que decide escopo,
+    autorização e contrato de resposta — um deploy dele era verificável apenas
+    pelo comportamento, o que serve para o smoke do dia e para nada depois."""
+
+    def test_stamp_records_mcp_revision_and_file_hashes(self):
+        server_mod._stamp_boot_provenance()
+        prov = server_mod._BOOT_PROVENANCE
+
+        assert prov["boot_sha_mcp_server.py"], "hash do server.py ausente"
+        assert prov["boot_sha_mcp_helpers.py"], "hash do helpers.py ausente"
+        assert prov["boot_sha_mcp_server.py"] != prov["boot_sha_mcp_helpers.py"]
+        assert "mcp_root" in prov
+        assert "boot_mcp_tree_dirty" in prov
+
+    def test_mcp_hashes_are_of_the_files_actually_imported(self):
+        """Contra o defeito já cometido no carimbo do fork: um caminho errado
+        publicava `null` em silêncio, no campo criado para acabar com silêncio."""
+        import hashlib
+        import pathlib
+
+        server_mod._stamp_boot_provenance()
+        alvo = pathlib.Path(server_mod.__file__).resolve()
+        esperado = hashlib.sha256(alvo.read_bytes()).hexdigest()[:12]
+
+        assert server_mod._BOOT_PROVENANCE["boot_sha_mcp_server.py"] == esperado
 
 
 class TestListEntities:
@@ -325,7 +535,7 @@ class TestDeleteEntities:
         parsed = json.loads(result)
         assert "error" in parsed
 
-    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=5)
+    @patch("mem0_mcp_selfhosted.server.safe_bulk_delete", return_value=_bulk_result(5))
     def test_delegates_safe_bulk_delete(self, mock_sbd, server_with_mock):
         srv, mem = server_with_mock
         fn = _get_tool_fn(srv, "delete_entities")

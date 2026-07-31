@@ -26,12 +26,42 @@ class TestBulkOperations:
                 user_id=test_user_id,
             )
 
-        count = safe_bulk_delete(memory_instance, {"user_id": test_user_id})
+        result = safe_bulk_delete(memory_instance, {"user_id": test_user_id})
 
-        assert count >= 1  # LLM may merge similar facts; at least 1 must exist
+        assert result.deleted >= 1  # LLM may merge similar facts; at least 1 must exist
+        assert result.failed_ids == []
+        # `complete` is the field that was structurally missing: a count alone
+        # could not distinguish "drained the scope" from "drained one page".
+        assert result.vector_scope_drained is True
+        assert result.remaining_ids == []
 
         remaining = memory_instance.get_all(user_id=test_user_id)
         assert len(remaining.get("results", [])) == 0
+
+    def test_safe_bulk_delete_crosses_the_page_boundary(self, memory_instance, test_user_id):
+        """The production defect: `list()` defaults to top_k=100, so a scope
+        larger than one page was silently half-deleted and reported as done.
+
+        Seeds raw points (no LLM) — this exercises the paging logic, not extraction.
+        """
+        import uuid
+
+        client = memory_instance.vector_store.client
+        collection = memory_instance.vector_store.collection_name
+        dims = memory_instance.vector_store.embedding_model_dims
+        scope = f"{test_user_id}-page"
+        points = [
+            {"id": str(uuid.uuid4()), "vector": [0.0] * dims,
+             "payload": {"data": f"page probe {i}", "user_id": scope}}
+            for i in range(150)
+        ]
+        client.upsert(collection_name=collection, points=points, wait=True)
+
+        result = safe_bulk_delete(memory_instance, {"user_id": scope}, page_size=100)
+
+        assert result.deleted == 150, "one page (100) would be the old behaviour"
+        assert result.vector_scope_drained is True
+        assert memory_instance.get_all(user_id=scope).get("results", []) == []
 
     def test_list_entities_facet(self, memory_instance):
         """Add memories with distinct user_ids, verify Facet API returns them."""

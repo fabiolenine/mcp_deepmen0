@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mem0-mcp-selfhosted"
-version = "0.3.0"
+version = "0.3.2"  # upstream elvismdev; a linhagem do fork está em [tool.deepmem0] abaixo
 description = "Self-hosted mem0 MCP server for Claude Code"
 license = "MIT"
 requires-python = ">=3.10"
@@ -84,3 +84,9 @@ upload_to_vcs_release = true
 [tool.semantic_release.remote]
 type = "github"
 token = { env = "GH_TOKEN" }
+
+
+[tool.deepmem0]
+# Linhagem do FORK, separada do trem de versões do upstream (ver CHANGELOG).
+mcp_release = "deepmem0-mcp-v0.2.0"
+diverged_from = "v0.3.2"
