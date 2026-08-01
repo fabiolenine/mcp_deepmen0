@@ -221,8 +221,11 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
     # descartou o prompt inteiro em 19/07. weight governa SÓ o termo da fusão;
     # tie_band governa o tie-break pós-rerank. São knobs independentes (é o que
     # torna possível rodar "só tie-break", com a fusão zerada).
+    # ⚠️ o 2º arg de env() aqui é INALCANÇÁVEL (o if já garante a presença) —
+    # fica alinhado ao RERANK_TIE_BAND do fork só para não virar armadilha de
+    # leitura. Era "0.002", a banda do espaço duplamente sigmoidado (31/07/2026).
     if opt_env("MEM0_DYNAMICS_TIE_BAND"):
-        dynamics_config["tie_band"] = float(env("MEM0_DYNAMICS_TIE_BAND", "0.002"))
+        dynamics_config["tie_band"] = float(env("MEM0_DYNAMICS_TIE_BAND", "0.008"))
     if opt_env("MEM0_REINFORCE_ON_SEARCH") is not None:
         dynamics_config["reinforce_on_search"] = bool_env("MEM0_REINFORCE_ON_SEARCH")
     if opt_env("MEM0_REINFORCE_TOP_N"):
@@ -260,8 +263,11 @@ def build_config() -> tuple[dict[str, Any], list[ProviderInfo], dict[str, Any] |
         temporality_config["event_ranking_weight"] = float(env("MEM0_EVENT_RANKING_WEIGHT", "0.15"))
     if opt_env("MEM0_EVENT_WINDOW_DAYS"):
         temporality_config["event_window_days"] = int(env("MEM0_EVENT_WINDOW_DAYS", "30"))
+    # ⚠️ default inalcançável (ver MEM0_DYNAMICS_TIE_BAND). Era "0.05" — a banda
+    # LARGA que o /critic-results de 23/07 reprovou por overfit; deixá-la escrita
+    # aqui insinuava que era o valor de referência. Alinhada ao RERANK_TIE_BAND.
     if opt_env("MEM0_EVENT_TIE_BAND"):
-        temporality_config["event_tie_band"] = float(env("MEM0_EVENT_TIE_BAND", "0.05"))
+        temporality_config["event_tie_band"] = float(env("MEM0_EVENT_TIE_BAND", "0.008"))
     if opt_env("MEM0_VERSION_ON_UPDATE") is not None:
         temporality_config["version_on_update"] = bool_env("MEM0_VERSION_ON_UPDATE")
     # v0.9: herança de ativação no update versionado (cópia + T2 + máscara).
