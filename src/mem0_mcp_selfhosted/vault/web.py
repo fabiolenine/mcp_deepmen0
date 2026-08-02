@@ -40,6 +40,9 @@ from starlette.templating import Jinja2Templates
 from mem0_mcp_selfhosted.env import env
 from mem0_mcp_selfhosted.vault import i18n, security
 from mem0_mcp_selfhosted.vault import store as vs
+from mem0_mcp_selfhosted.vault.guards import login_required
+from mem0_mcp_selfhosted.vault.memories.sources import build_sources
+from mem0_mcp_selfhosted.vault.memories.views import MemoriesRoutes
 from mem0_mcp_selfhosted.vault.middleware import normalize_mode
 
 logger = logging.getLogger(__name__)
@@ -344,20 +347,10 @@ class VaultWeb:
         return request.client.host if request.client else ""
 
 
-def login_required(handler: Callable) -> Callable:
-    @wraps(handler)
-    async def wrapper(self: VaultWeb, request: Request) -> Response:
-        if self.current_admin(request) is None:
-            return self.redirect(request, "/login")
-        return await handler(self, request)
-
-    return wrapper
-
-
 # ---------------------------------------------------------------- routes
 
 
-class Routes(VaultWeb):
+class Routes(MemoriesRoutes, VaultWeb):
     # -- session --------------------------------------------------------
 
     async def login_page(self, request: Request) -> Response:
@@ -436,17 +429,30 @@ class Routes(VaultWeb):
 
     @login_required
     async def dashboard(self, request: Request) -> Response:
-        users = self.store.list_users()
         stats = self.store.stats()
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         seen_24h = self.store.count_tokens_used_since(cutoff)
         return self.render(
             request, "dashboard.html", nav="dash",
-            users=users, stats=stats, seen_24h=seen_24h, mcp=_mcp_health(),
+            stats=stats, seen_24h=seen_24h, mcp=_mcp_health(),
+            corpus=await self.corpus_tiles(request),
             readiness=self.store.promotion_readiness(
                 window_hours=_readiness_window_hours(),
                 denial_window_hours=_denial_window_hours(),
             ),
+            observe_url=env("VAULT_OBSERVE_URL"),
+        )
+
+    @login_required
+    async def users_page(self, request: Request) -> Response:
+        """Usuários e tokens — a tela que era a metade de baixo do painel.
+
+        Separada porque o painel virou visão geral de DUAS coisas (credenciais e
+        corpus); a lista de usuários é trabalho, não panorama.
+        """
+        return self.render(
+            request, "users.html", nav="users",
+            users=self.store.list_users(),
             new_user_open=bool(request.query_params.get("new")),
             error=request.query_params.get("error", ""),
         )
@@ -457,7 +463,7 @@ class Routes(VaultWeb):
         form = await self.form(request)
         lang = self.lang(request)
         if not self.csrf_guard(request, form):
-            return self.redirect(request, f"/?new=1&error={i18n.error_message(lang, 'csrf')}")
+            return self.redirect(request, f"/users?new=1&error={i18n.error_message(lang, 'csrf')}")
         try:
             name = security.normalize_name(form.get("display_name", ""))
             email = security.normalize_email(form.get("email", ""))
@@ -467,13 +473,13 @@ class Routes(VaultWeb):
             )
         except security.ValidationError as exc:
             return self.redirect(
-                request, f"/?new=1&error={i18n.error_message(lang, str(exc))}"
+                request, f"/users?new=1&error={i18n.error_message(lang, str(exc))}"
             )
         except vs.DuplicateEmail:
             return self.redirect(
-                request, f"/?new=1&error={i18n.error_message(lang, 'duplicate_email')}"
+                request, f"/users?new=1&error={i18n.error_message(lang, 'duplicate_email')}"
             )
-        return self.redirect(request, "/")
+        return self.redirect(request, "/users")
 
     # -- user detail ----------------------------------------------------
 
@@ -481,9 +487,9 @@ class Routes(VaultWeb):
     async def user_detail(self, request: Request) -> Response:
         user = self.store.get_user(int(request.path_params["user_id"]))
         if user is None:
-            return self.redirect(request, "/")
+            return self.redirect(request, "/users")
         return self.render(
-            request, "user.html", nav="dash",
+            request, "user.html", nav="users",
             user=user, tokens=self.store.list_tokens(user["id"]),
             error=request.query_params.get("error", ""),
         )
@@ -584,7 +590,7 @@ class Routes(VaultWeb):
         # No-JS fallback: full page with the modal already open.
         user = self.store.get_user(user_id)
         return self.render(
-            request, "user.html", nav="dash", user=user,
+            request, "user.html", nav="users", user=user,
             tokens=self.store.list_tokens(user_id),
             token=plaintext, subject=subject, error="",
         )
@@ -628,7 +634,12 @@ class Routes(VaultWeb):
 # ---------------------------------------------------------------- factory
 
 
-def create_app(db_path: str | None = None, *, secret_key: str | None = None) -> Starlette:
+def create_app(
+    db_path: str | None = None,
+    *,
+    secret_key: str | None = None,
+    sources: Any | None = None,
+) -> Starlette:
     key = secret_key or env("VAULT_SECRET_KEY")
     if not key:
         raise RuntimeError(
@@ -647,6 +658,7 @@ def create_app(db_path: str | None = None, *, secret_key: str | None = None) -> 
         Route("/login", r.login_submit, methods=["POST"]),
         Route("/logout", r.logout, methods=["POST"]),
         Route("/", r.dashboard, methods=["GET"]),
+        Route("/users", r.users_page, methods=["GET"]),
         Route("/users", r.create_user, methods=["POST"]),
         Route("/users/{user_id:int}", r.user_detail, methods=["GET"]),
         Route("/users/{user_id:int}/disable", r.set_disabled, methods=["POST"]),
@@ -655,6 +667,14 @@ def create_app(db_path: str | None = None, *, secret_key: str | None = None) -> 
         Route("/tokens/{token_id:int}/rotate", r.rotate_token, methods=["POST"]),
         Route("/tokens/{token_id:int}/revoke", r.revoke_token, methods=["POST"]),
         Route("/audit", r.audit, methods=["GET"]),
+        Route("/memories", r.memories_list, methods=["GET"]),
+        Route("/memories/{memory_id}", r.memory_detail, methods=["GET"]),
+        Route("/search", r.search_page, methods=["GET"]),
+        Route("/search/results", r.search_results, methods=["GET"]),
+        Route("/queue", r.queue_page, methods=["GET"]),
+        Route("/queue/summary", r.queue_summary, methods=["GET"]),
+        Route("/entities", r.entities_list, methods=["GET"]),
+        Route("/entities/{point_id}", r.entity_detail, methods=["GET"]),
         Route("/healthz", r.healthz, methods=["GET"]),
         Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
     ]
@@ -670,4 +690,9 @@ def create_app(db_path: str | None = None, *, secret_key: str | None = None) -> 
         ],
     )
     app.state.store = store
+    # Fontes de leitura do corpus. `build_sources` nunca levanta: fonte ausente
+    # vira card na tela de memórias, e o cofre continua servindo credenciais.
+    # Injetável para que teste use fake em vez de abrir cliente real (e ler a
+    # api-key do disco) só para exercitar uma tela de credencial.
+    app.state.sources = sources if sources is not None else build_sources()
     return app

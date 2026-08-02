@@ -1,0 +1,75 @@
+{% if source_error %}
+<div class="card accent">
+  <span class="title">{{ t.queueUnavailable }}</span>
+  <p class="note mono">{{ source_error }}</p>
+</div>
+{% else %}
+<div class="stats">
+  <div class="stat">
+    <span class="lbl">{{ t.queueDepth }}</span>
+    <div class="row">
+      <span class="val">{{ summary.depth }}</span>
+      <span class="sub">{{ t.queueActive }}</span>
+    </div>
+  </div>
+  <div class="stat">
+    <span class="lbl">{{ t.queuePending }}</span>
+    <div class="row">
+      <span class="val">{{ summary.by_status.get('pending', 0) }}</span>
+      {% if summary.oldest_pending_age_s %}
+      <span class="sub">{{ t.queueOldest }} {{ (summary.oldest_pending_age_s / 60) | round | int }} min</span>
+      {% endif %}
+    </div>
+  </div>
+  <div class="stat">
+    <span class="lbl">{{ t.queueRetry }}</span>
+    <div class="row">
+      <span class="val">{{ summary.by_status.get('failed_retryable', 0) }}</span>
+      <span class="sub">{{ summary.by_status.get('processing', 0) }} {{ t.queueProcessing }}</span>
+    </div>
+  </div>
+  <div class="stat">
+    <span class="lbl">{{ t.queueDead }}</span>
+    <div class="row">
+      <span class="val">{{ summary.by_status.get('dead', 0) }}</span>
+      <span class="sub">{{ summary.by_status.get('done', 0) }} {{ t.queueDone }}</span>
+    </div>
+  </div>
+</div>
+
+{% if active %}
+<div class="card">
+  <span class="title">{{ t.queueActiveJobs }}</span>
+  {% for job in active %}
+  <div class="job">
+    <div class="job-head">
+      <span class="badge mono {{ 'warn' if job.status != 'processing' else 'info' }}">{{ job.status }}</span>
+      <span class="badge">{{ job.kind }}</span>
+      <span class="mono note">{{ job.task_id }}</span>
+      {% if job.source_doc %}<span class="chip">{{ job.source_doc }}</span>{% endif %}
+      <span class="grow"></span>
+      {% if job.heartbeat_age_s is not none %}
+      <span class="note {{ 'stalled' if job.heartbeat_age_s > 600 }}">
+        {{ t.queueHeartbeat }} {{ job.heartbeat_age_s | round | int }}s
+      </span>
+      {% elif job.age_s %}
+      <span class="note">{{ t.queueWaiting }} {{ (job.age_s / 60) | round | int }} min</span>
+      {% endif %}
+    </div>
+    {% if job.chunks_total %}
+    <div class="progress-bar" role="img"
+         aria-label="{{ job.chunks_done or 0 }}/{{ job.chunks_total }}">
+      <span style="width: {{ ((job.chunks_done or 0) / job.chunks_total * 100) | round | int }}%"></span>
+    </div>
+    <span class="note">{{ job.chunks_done or 0 }}/{{ job.chunks_total }} {{ t.queueChunks }}</span>
+    {% endif %}
+    {% if job.attempts %}
+    <span class="note">{{ t.jobAttempts }}: {{ job.attempts }}{% if job.last_error %} · <span class="mono">{{ job.last_error[:140] }}</span>{% endif %}</span>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% else %}
+<div class="card"><p class="note">{{ t.queueIdle }}</p></div>
+{% endif %}
+{% endif %}

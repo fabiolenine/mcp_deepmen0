@@ -1,0 +1,102 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ t.navMemories }}</h1>
+      <p>
+        {{ t.memSub }} ·
+        <span class="mono">{{ scope.user_id }}</span>
+        {%- if scope.agent_id %} · <span class="mono">{{ scope.agent_id }}</span>{% endif %}
+        {%- if scope.run_id %} · <span class="mono">{{ scope.run_id }}</span>{% endif %}
+      </p>
+    </div>
+    <span class="note">
+      {% if filters %}{{ filtered }} {{ t.ofTotal }} {{ total }}{% else %}{{ total }} {{ t.memUnit }}{% endif %}
+    </span>
+  </div>
+
+  {% if source_error %}
+  <div class="card accent">
+    <span class="title">{{ t.srcUnavailable }}</span>
+    <p class="note mono">{{ source_error }}</p>
+    <p class="note">{{ t.srcUnavailableHint }}</p>
+  </div>
+  {% else %}
+
+  <div class="card facets">
+    {% for key in facet_keys %}
+      {% if facets.get(key) %}
+      <div class="facet-group">
+        <span class="lbl">{{ t['facet_' ~ key] }}</span>
+        <div class="chips">
+          {% if filters.get(key) %}
+          <a class="facet-chip on" href="/memories?{{ drop(key) }}">{{ filters[key] }} ✕</a>
+          {% else %}
+            {% for hit in facets[key][:8] %}
+            <a class="facet-chip" href="/memories?{{ setf(key, hit.value) }}">
+              {{ hit.value }} <b>{{ hit.count }}</b>
+            </a>
+            {% endfor %}
+          {% endif %}
+        </div>
+      </div>
+      {% endif %}
+    {% endfor %}
+    <div class="facet-group">
+      <span class="lbl">{{ t.facetFlags }}</span>
+      <div class="chips">
+        {% for flag, label in [('only_superseded', t.flagSuperseded), ('has_event_date', t.flagEventDate), ('only_documents', t.flagDocument)] %}
+        <a class="facet-chip {{ 'on' if filters.get(flag) }}"
+           href="/memories?{{ drop(flag) if filters.get(flag) else setf(flag, '1') }}">
+          {{ label }}{% if filters.get(flag) %} ✕{% endif %}
+        </a>
+        {% endfor %}
+        {% if filters %}
+        <a class="facet-chip clear" href="/memories">{{ t.facetClear }}</a>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="card table">
+    <div class="head cols-mem">
+      <span>{{ t.colMemory }}</span><span>{{ t.colClass }}</span>
+      <span>{{ t.colImportance }}</span><span>{{ t.colCreated }}</span>
+    </div>
+    {% for row in rows %}
+    <a class="row cols-mem" href="/memories/{{ row.id }}">
+      <div class="mem-cell">
+        <span class="excerpt">{{ row.excerpt }}</span>
+        <span class="meta">
+          {%- if row.superseded %}<span class="badge warn">{{ t.badgeSuperseded }}</span>{% endif %}
+          {%- if row.source_doc %}<span class="badge info">{{ t.badgeDoc }}</span>{% endif %}
+          {%- if row.event_date %}<span class="badge info">{{ row.event_date }}</span>{% endif %}
+          {%- if row.actor_id %}<span class="badge info">{{ row.actor_id }}</span>{% endif %}
+          {%- for tag in row.tags[:4] %}<span class="chip">{{ tag }}</span>{% endfor %}
+        </span>
+      </div>
+      <span class="cell">
+        {{ row.domain or '—' }}{% if row.memory_type %} · {{ row.memory_type }}{% endif %}
+      </span>
+      <span class="cell strong">{{ '%.2f' | format(row.importance) if row.importance is number else '—' }}</span>
+      <span class="cell">{{ humanize(row.created_at, lang) }}</span>
+    </a>
+    {% else %}
+    <div class="empty">{{ t.noMemories }}</div>
+    {% endfor %}
+  </div>
+
+  <div class="pager">
+    {% if has_prev %}
+    <a class="btn-ghost btn-small" href="/memories{% if base_query %}?{{ base_query }}{% endif %}">← {{ t.pagFirst }}</a>
+    {% endif %}
+    {% if next_cursor %}
+    <a class="btn-ghost btn-small"
+       href="/memories?cursor={{ next_cursor }}{% if base_query %}&{{ base_query }}{% endif %}">{{ t.pagOlder }} →</a>
+    {% endif %}
+    <span class="note">{{ t.pagNote }}</span>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

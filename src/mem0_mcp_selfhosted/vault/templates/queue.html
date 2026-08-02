@@ -1,0 +1,39 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ t.navQueue }}</h1>
+      <p>{{ t.queueSub }}</p>
+    </div>
+    <span class="note">{{ t.queueAutoRefresh }}</span>
+  </div>
+
+  <div hx-get="/queue/summary" hx-trigger="every 10s" hx-swap="innerHTML">
+    {% include "partials/queue_summary.html" %}
+  </div>
+
+  {% if dead %}
+  <div class="card table">
+    <div class="head cols-dead">
+      <span>{{ t.colWhen }}</span><span>kind</span>
+      <span>{{ t.jobAttempts }}</span><span>{{ t.queueError }}</span>
+    </div>
+    {% for job in dead %}
+    <div class="row cols-dead">
+      <span class="cell mono">{{ job.finished_at or job.submitted_at }}</span>
+      <span class="cell">{{ job.kind }}</span>
+      <span class="cell strong">{{ job.attempts }}</span>
+      <span class="cell">
+        <details>
+          <summary class="mono">{{ (job.last_error or '—')[:80] }}</summary>
+          <pre class="kv-pre">{{ job.last_error or '' }}</pre>
+        </details>
+      </span>
+    </div>
+    {% endfor %}
+  </div>
+  <p class="note">{{ t.queueDeadNote }}</p>
+  {% endif %}
+</div>
+{% endblock %}

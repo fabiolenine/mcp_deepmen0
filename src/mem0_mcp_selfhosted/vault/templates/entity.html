@@ -1,0 +1,78 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ entity.data if entity else t.entDetail }}</h1>
+      {% if entity %}
+      <p class="mono">{{ entity.data_normalized }} · {{ entity.entity_type }}</p>
+      {% endif %}
+    </div>
+    <a class="btn-ghost btn-small" href="/entities">← {{ t.back }}</a>
+  </div>
+
+  {% if source_error %}
+  <div class="card accent">
+    <span class="title">{{ t.srcUnavailable }}</span>
+    <p class="note mono">{{ source_error }}</p>
+  </div>
+  {% elif not_found %}
+  <div class="card accent">
+    <span class="title">{{ t.entNotFound }}</span>
+    <p class="note">{{ t.memNotFoundHint }}</p>
+  </div>
+  {% else %}
+
+  <div class="card">
+    <div class="kv-grid">
+      <div><span class="lbl">{{ t.entKind }}</span><span class="val">{{ entity.entity_type or '—' }}</span></div>
+      <div><span class="lbl">{{ t.entLinks }}</span><span class="val strong">{{ entity.link_count }}</span></div>
+      <div><span class="lbl">{{ t.entIdentity }}</span><span class="val mono">{{ entity.data_normalized }}</span></div>
+    </div>
+    <p class="note">{{ t.entIdentityNote }}</p>
+  </div>
+
+  <div class="card table">
+    <div class="head cols-mem">
+      <span>{{ t.colMemory }}</span><span>{{ t.colClass }}</span>
+      <span>{{ t.colImportance }}</span><span>{{ t.colCreated }}</span>
+    </div>
+    {% for row in memories %}
+    <a class="row cols-mem" href="/memories/{{ row.id }}">
+      <div class="mem-cell">
+        <span class="excerpt">{{ row.excerpt }}</span>
+        <span class="meta">
+          {%- if row.superseded %}<span class="badge warn">{{ t.badgeSuperseded }}</span>{% endif %}
+          {%- if row.source_doc %}<span class="badge info">{{ t.badgeDoc }}</span>{% endif %}
+        </span>
+      </div>
+      <span class="cell">{{ row.domain or '—' }}{% if row.memory_type %} · {{ row.memory_type }}{% endif %}</span>
+      <span class="cell strong">{{ '%.2f' | format(row.importance) if row.importance is number else '—' }}</span>
+      <span class="cell">{{ humanize(row.created_at, lang) }}</span>
+    </a>
+    {% else %}
+    <div class="empty">{{ t.entNoMemories }}</div>
+    {% endfor %}
+  </div>
+
+  {% if missing %}
+  <div class="warn-box">
+    <span class="dot"></span>
+    <p>{{ t.entDangling }}: {{ missing | length }}
+      {% for mid in missing[:5] %}<span class="mono">{{ mid }}</span>{% if not loop.last %}, {% endif %}{% endfor %}
+    </p>
+  </div>
+  {% endif %}
+
+  {% if entity.link_count > memories | length + missing | length %}
+  <p class="note">{{ t.entTruncated }} {{ memories | length }} {{ t.ofTotal }} {{ entity.link_count }}.</p>
+  {% endif %}
+
+  <div class="card">
+    <span class="title">{{ t.memPayload }}</span>
+    <p class="note">{{ t.entPayloadNote }}</p>
+    <pre class="kv-pre">{{ raw_json }}</pre>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

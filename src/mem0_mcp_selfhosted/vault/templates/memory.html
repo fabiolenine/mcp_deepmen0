@@ -1,0 +1,203 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ t.memDetail }}</h1>
+      {% if memory %}<p class="mono">{{ memory.id }}</p>{% endif %}
+    </div>
+    <a class="btn-ghost btn-small" href="/memories">← {{ t.back }}</a>
+  </div>
+
+  {% if source_error %}
+  <div class="card accent">
+    <span class="title">{{ t.srcUnavailable }}</span>
+    <p class="note mono">{{ source_error }}</p>
+  </div>
+  {% elif not_found %}
+  <div class="card accent">
+    <span class="title">{{ t.memNotFound }}</span>
+    <p class="note">{{ t.memNotFoundHint }}</p>
+  </div>
+  {% else %}
+
+  {% if block_errors %}
+  <div class="warn-box">
+    <span class="dot"></span>
+    <p>{{ t.memPartial }}{% for err in block_errors %} · <span class="mono">{{ err }}</span>{% endfor %}</p>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <div class="mem-head">
+      {% if memory.superseded %}<span class="badge warn">{{ t.badgeSuperseded }}</span>{% endif %}
+      {% if provenance.is_document %}<span class="badge info">{{ t.badgeDoc }}</span>{% endif %}
+      {% if memory.domain %}<span class="badge info">{{ memory.domain }}</span>{% endif %}
+      {% if memory.memory_type %}<span class="badge info">{{ memory.memory_type }}</span>{% endif %}
+      {% if memory.actor_id %}<span class="badge info">{{ t.fldActor }}: {{ memory.actor_id }}</span>{% endif %}
+      {% if memory.attributed_to %}<span class="badge">{{ memory.attributed_to }}</span>{% endif %}
+      {% for tag in memory.tags %}<span class="chip">{{ tag }}</span>{% endfor %}
+    </div>
+    <p class="mem-text">{{ full_text }}</p>
+    <div class="kv-grid">
+      <div><span class="lbl">{{ t.colCreated }}</span><span class="val mono">{{ payload.created_at or '—' }}</span></div>
+      <div><span class="lbl">{{ t.colImportance }}</span><span class="val">{{ payload.importance if payload.importance is not none else '—' }}</span></div>
+      <div><span class="lbl">{{ t.fldConfidence }}</span><span class="val">{{ payload.confidence if payload.confidence is not none else '—' }}</span></div>
+      <div><span class="lbl">{{ t.fldProject }}</span><span class="val">{{ payload.project or '—' }}</span></div>
+      <div><span class="lbl">{{ t.fldEventDate }}</span><span class="val mono">{{ payload.event_date or '—' }}</span></div>
+      <div><span class="lbl">{{ t.fldScope }}</span><span class="val mono">{{ payload.memory_scope or '—' }}</span></div>
+    </div>
+  </div>
+
+  <div class="detail-grid">
+    <div class="card">
+      <span class="title">{{ t.memActr }}</span>
+      {% if actr.error %}
+      <p class="note mono">{{ actr.error }}</p>
+      {% elif not actr.has_history %}
+      <p class="note">{{ t.actrNeutral }}</p>
+      {% else %}
+      <div class="kv-grid">
+        <div>
+          <span class="lbl">{{ t.actrActivation }}</span>
+          <span class="val mono">{{ '%.4f' | format(actr.activation) if actr.activation is not none else '—' }}</span>
+        </div>
+        <div>
+          <span class="lbl">{{ t.actrBoost }}</span>
+          <span class="val mono">{{ '%.4f' | format(actr.boost) }}</span>
+        </div>
+        <div><span class="lbl">{{ t.actrAccess }}</span><span class="val">{{ actr.access_count or '—' }}</span></div>
+        <div><span class="lbl">{{ t.actrLast }}</span><span class="val">{{ humanize(actr.last_accessed, lang) }}</span></div>
+      </div>
+      {% if actr.reinforce_counts %}
+      <div class="chips">
+        {% for trigger, count in actr.reinforce_counts.items() %}
+        <span class="chip">{{ trigger }} × {{ count }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+      <p class="note">{{ t.actrNote }}</p>
+      <div class="timeline">
+        {% for ts in actr.reinforced_at[-10:] %}
+        <span class="mono">{{ ts }}</span>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <span class="title">{{ t.memChain }}</span>
+      {% if not chain.newer and not chain.older and not links.superseded_by %}
+      <p class="note">{{ t.chainNone }}</p>
+      {% else %}
+      {% if chain.older %}
+      <span class="lbl">{{ t.chainOlder }}</span>
+      {% for row in chain.older %}
+        {% if row.missing %}
+        <p class="note mono">{{ row.id }} · {{ t.chainMissing }}</p>
+        {% else %}
+        <a class="chain-item" href="/memories/{{ row.id }}">
+          <span class="excerpt">{{ row.excerpt }}</span>
+          <span class="note mono">{{ row.created_at }}</span>
+        </a>
+        {% endif %}
+      {% endfor %}
+      {% endif %}
+      {% if chain.newer %}
+      <span class="lbl">{{ t.chainNewer }}</span>
+      {% for row in chain.newer %}
+        {% if row.missing %}
+        <p class="note mono">{{ row.id }} · {{ t.chainMissing }}</p>
+        {% else %}
+        <a class="chain-item" href="/memories/{{ row.id }}">
+          <span class="excerpt">{{ row.excerpt }}</span>
+          <span class="note mono">{{ row.created_at }}</span>
+        </a>
+        {% endif %}
+      {% endfor %}
+      {% endif %}
+      {% if links.superseded_at %}
+      <p class="note">{{ t.chainSupersededAt }}: <span class="mono">{{ links.superseded_at }}</span></p>
+      {% endif %}
+      {% endif %}
+    </div>
+  </div>
+
+  {% if provenance.is_document %}
+  <div class="card">
+    <span class="title">{{ t.memProvenance }}</span>
+    <div class="kv-grid">
+      <div><span class="lbl">{{ t.provDoc }}</span><span class="val mono">{{ provenance.source_doc }}</span></div>
+      <div>
+        <span class="lbl">{{ t.provPages }}</span>
+        <span class="val mono">{{ provenance.page_start }}{% if provenance.page_end and provenance.page_end != provenance.page_start %}–{{ provenance.page_end }}{% endif %}</span>
+      </div>
+      <div>
+        <span class="lbl">{{ t.provChunk }}</span>
+        <span class="val mono">{{ provenance.chunk_index }}{% if provenance.chunks_total %}/{{ provenance.chunks_total }}{% endif %}</span>
+      </div>
+      <div><span class="lbl">{{ t.provType }}</span><span class="val mono">{{ provenance.content_type or '—' }}</span></div>
+    </div>
+    {% if provenance.doc_sha256 %}
+    <p class="note mono">sha256 {{ provenance.doc_sha256 }}</p>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if job %}
+  <div class="card">
+    <span class="title">{{ t.memJob }}</span>
+    <div class="kv-grid">
+      <div><span class="lbl">task</span><span class="val mono">{{ job.task_id }}</span></div>
+      <div><span class="lbl">{{ t.colStatus }}</span><span class="val"><span class="badge {{ 'ok' if job.status == 'done' else ('danger' if job.status == 'dead' else 'warn') }}">{{ job.status }}</span></span></div>
+      <div><span class="lbl">kind</span><span class="val mono">{{ job.kind }}</span></div>
+      <div><span class="lbl">{{ t.jobAttempts }}</span><span class="val">{{ job.attempts }}</span></div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <span class="title">{{ t.memEntities }} <span class="note">({{ entities | length }})</span></span>
+    {% if entities %}
+    <div class="chips">
+      {% for ent in entities %}
+      <a class="facet-chip" href="/entities/{{ ent.id }}">{{ ent.data }} <b>{{ ent.link_count }}</b></a>
+      {% endfor %}
+    </div>
+    {% else %}
+    <p class="note">{{ t.entNone }}</p>
+    {% endif %}
+  </div>
+
+  <div class="card table">
+    <div class="head cols-hist">
+      <span>{{ t.colWhen }}</span><span>{{ t.histEvent }}</span>
+      <span>{{ t.histActor }}</span><span>{{ t.histChange }}</span>
+    </div>
+    {% for ev in history %}
+    <div class="row cols-hist">
+      <span class="cell mono">{{ ev.created_at }}</span>
+      <span class="badge mono {{ 'danger' if ev.event == 'DELETE' else ('warn' if ev.event == 'SUPERSEDED' else 'info') }}">{{ ev.event }}</span>
+      <span class="cell">{{ ev.actor_id or ev.role or '—' }}</span>
+      <span class="cell">{{ (ev.new_memory or ev.old_memory or '')[:120] }}</span>
+    </div>
+    {% else %}
+    <div class="empty">{{ t.histNone }}</div>
+    {% endfor %}
+  </div>
+
+  {% if delete_intent %}
+  <div class="warn-box">
+    <span class="dot"></span>
+    <p>{{ t.histDeleteIntent }} · <span class="mono">{{ delete_intent.op_id }}</span> · {{ delete_intent.created_at }}</p>
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <span class="title">{{ t.memPayload }}</span>
+    <p class="note">{{ t.memPayloadNote }}</p>
+    <pre class="kv-pre">{{ raw_json }}</pre>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}

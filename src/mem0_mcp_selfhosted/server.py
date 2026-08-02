@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from mem0.memory.utils import normalize_scope_id
+from mem0.memory.utils import normalize_scope_id, normalize_speaker_label
 from mem0_mcp_selfhosted.config import ProviderInfo, build_config, configured_language
 from mem0_mcp_selfhosted.document_source import resolve_and_spool
 from mem0_mcp_selfhosted.env import bool_env, env
@@ -527,6 +527,60 @@ def _normalized_scope(agent_id, run_id) -> tuple[str | None, str | None, str | N
 #:   record-owner  — addresses a record by id; the record's owner is checked
 #:   filtered      — enumerates; the answer is narrowed to the bound scope
 #:   operator-only — global/operational; refused to a scope-bound token
+#: Teto de `limit` do `get_memories`. O parâmetro esteve MORTO desde sempre
+#: (caía no `**kwargs` do core e sumia), então nunca houve validação alguma —
+#: ativá-lo é a primeira vez que um valor do chamador chega ao store por esse
+#: caminho. O teto barra o pedido acidental de milhões, que faria o Qdrant
+#: varrer a collection inteira.
+#:
+#: ⚠️ ISTO É UMA PRIMEIRA PÁGINA COM TETO, NÃO PAGINAÇÃO. `Memory.get_all` é
+#: `(*, filters=None, top_k=20, **kwargs)` — o core NÃO expõe offset nem cursor,
+#: então não há como alcançar o que fica além do teto por esta tool. MEDIDO em
+#: 02/08/2026: um escopo de produção real tem 1202 memórias, ou seja, **o teto
+#: morde de verdade** — 202 ficam inalcançáveis aqui.
+#:
+#: Isso NÃO é regressão: antes desta mudança o `limit` era descartado e a tool
+#: devolvia 20 sempre, então o alcance era 20, não 1202. Mas também não é
+#: "generoso" (uma versão anterior deste comentário afirmava isso, e era falso
+#: nas duas pontas: não há paginação, e 1000 < corpus). Quem precisa varrer o
+#: escopo inteiro deve usar o Qdrant direto ou ganhar uma tool com cursor —
+#: decisão de projeto em aberto, não resolvida aqui.
+MAX_GET_LIMIT = 1000
+
+
+def _com_actor_id(filters: dict | None, actor_id: str | None) -> tuple[dict | None, str | None]:
+    """Dobra `actor_id` dentro de `filters`. Devolve `(filters, erro)`.
+
+    ⚠️ Vai no `filters`, não como kwarg de topo: `Memory.search` NÃO declara
+    `actor_id`, e o lift de kwargs do core cobre só `user_id`/`agent_id`/`run_id`.
+    Um `actor_id=` de topo seria ENGOLIDO em silêncio — a mesma classe do `limit`
+    morto do `get_memories`.
+
+    ⚠️ Precedência por `is not None`, NÃO por truthiness. Com
+    `actor_id or filters["actor_id"]`, um `actor_id=""` explícito cairia
+    silenciosamente no filtro do chamador em vez de falhar na validação — o
+    chamador pediria uma coisa e receberia outra sem aviso.
+
+    ⚠️ O `filters` do chamador é COPIADO. Mutar o dict que ele nos passou
+    mudaria estado que não é nosso.
+
+    A validação reusa `normalize_speaker_label` do core (mesmo precedente do
+    `normalize_scope_id`): escrita e consulta canonizando diferente é filtro
+    exato que erra em silêncio, porque o Qdrant casa por igualdade.
+    """
+    if actor_id is None:
+        return filters, None
+    rotulo = normalize_speaker_label(actor_id)
+    if rotulo is None:
+        return None, (
+            f"actor_id inválido: {actor_id!r}. Um rótulo de locutor é texto não-vazio, "
+            "sem quebra de linha, com letras/dígitos/espaço e `. - _ '`."
+        )
+    novo = dict(filters) if filters else {}
+    novo["actor_id"] = rotulo
+    return novo, None
+
+
 TOOL_SCOPE_POLICY: dict[str, str] = {
     "add_memory": "scope-arg",
     "add_document": "scope-arg",
@@ -1240,6 +1294,7 @@ def _register_tools(mcp: FastMCP) -> None:
         agent_id: Annotated[str | None, Field(description="Agent scope.")] = None,
         run_id: Annotated[str | None, Field(description="Run scope.")] = None,
         filters: Annotated[dict | None, Field(description="Additional structured filter clauses.")] = None,
+        actor_id: Annotated[str | None, Field(description="Keep only memories SPOKEN BY this speaker (v0.15 attribution). Exact match on the canonical speaker label; wins over an actor_id given inside `filters`. Memories with no speaker are excluded while this is set.")] = None,
         limit: Annotated[int | None, Field(description="Maximum number of results (default 10).")] = None,
         threshold: Annotated[float | None, Field(description="Minimum relevance score (0.0-1.0).")] = None,
         rerank: Annotated[bool | None, Field(description="Whether to apply reranking. Defaults to the server's MEM0_ENABLE_RERANK.")] = None,
@@ -1264,6 +1319,9 @@ def _register_tools(mcp: FastMCP) -> None:
             kwargs["agent_id"] = agent_id
         if run_id:
             kwargs["run_id"] = run_id
+        filters, actor_err = _com_actor_id(filters, actor_id)
+        if actor_err:
+            return json.dumps({"error": actor_err}, ensure_ascii=False)
         if filters:
             kwargs["filters"] = filters
         # mem0ai 2.0.7: Memory.search recebe top_k (limit cairia no **kwargs e seria
@@ -1391,20 +1449,49 @@ def _register_tools(mcp: FastMCP) -> None:
         user_id: Annotated[str | None, Field(description="User scope. Defaults to MEM0_USER_ID.")] = None,
         agent_id: Annotated[str | None, Field(description="Agent scope.")] = None,
         run_id: Annotated[str | None, Field(description="Run scope.")] = None,
-        limit: Annotated[int | None, Field(description="Maximum number of memories to return.")] = None,
+        limit: Annotated[int | None, Field(description="Maximum number of memories to return (1-1000, default 20). This is a CAPPED FIRST PAGE, not pagination: there is no offset/cursor, so memories beyond the cap are not reachable through this tool.")] = None,
+        actor_id: Annotated[str | None, Field(description="Keep only memories SPOKEN BY this speaker (v0.15 attribution). Memories with no speaker are excluded while this is set.")] = None,
     ) -> str:
         """Page through memories using filters instead of search."""
         uid, auth_err = _effective_user_id(user_id)
         if auth_err:
             return json.dumps({"error": auth_err}, ensure_ascii=False)
 
+        # `get_all` já aceita `filters=` e já canoniza `actor_id` lá dentro, então
+        # não é preciso mudar o core: basta montar o dicionário aqui. As chaves de
+        # escopo continuam indo como kwarg de topo — o core as levanta para dentro
+        # do filtro sozinho.
+        filtros, actor_err = _com_actor_id(None, actor_id)
+        if actor_err:
+            return json.dumps({"error": actor_err}, ensure_ascii=False)
+
         kwargs: dict[str, Any] = {"user_id": uid}
+        if filtros:
+            kwargs["filters"] = filtros
         if agent_id:
             kwargs["agent_id"] = agent_id
         if run_id:
             kwargs["run_id"] = run_id
         if limit is not None:
-            kwargs["limit"] = limit
+            # ⚠️ `top_k`, NÃO `limit`. A assinatura do core é
+            # `get_all(*, filters=None, top_k=20, **kwargs)` e o corpo faz
+            # `limit = top_k` — então `limit=` caía no `**kwargs` e SUMIA.
+            # MEDIDO no caminho real: `get_all(limit=100)` devolvia **20**,
+            # `get_all(top_k=100)` devolvia 100. Pedir 100 e receber 20, mudo.
+            #
+            # ⚠️ O teste unitário passava porque assere contra `MagicMock`, que
+            # aceita qualquer kwarg. Mesma classe do teto de assinatura do
+            # Patch 3b: mock não tem contrato, então não pode provar contrato.
+            # A guarda agora é asserção sobre os argumentos REAIS da chamada.
+            #
+            # ⚠️ Limites: o campo esteve morto desde sempre, logo nunca houve
+            # validação. Ativá-lo sem teto exporia 0, negativo e valor gigante
+            # ao store.
+            if not isinstance(limit, int) or isinstance(limit, bool) or not (1 <= limit <= MAX_GET_LIMIT):
+                return json.dumps(
+                    {"error": f"limit inválido: {limit!r}. Use um inteiro entre 1 e {MAX_GET_LIMIT}."},
+                    ensure_ascii=False)
+            kwargs["top_k"] = limit
 
         mem = _ensure_memory()
         if mem is None:

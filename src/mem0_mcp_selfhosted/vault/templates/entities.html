@@ -1,0 +1,62 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ t.navEntities }}</h1>
+      <p>{{ t.entSub }}</p>
+    </div>
+    <span class="note">{{ total }} {{ t.entUnit }}</span>
+  </div>
+
+  {% if source_error %}
+  <div class="card accent">
+    <span class="title">{{ t.srcUnavailable }}</span>
+    <p class="note mono">{{ source_error }}</p>
+  </div>
+  {% else %}
+
+  <form class="card" method="get" action="/entities">
+    <div class="search-main">
+      <input type="search" name="q" value="{{ q }}" placeholder="{{ t.entSearchPh }}" maxlength="120">
+      <button class="btn" type="submit">{{ t.entSearch }}</button>
+    </div>
+    <div class="chips">
+      <a class="facet-chip {{ 'on' if not entity_type }}" href="/entities{% if q %}?q={{ q | urlencode }}{% endif %}">
+        {{ t.facetAll }}
+      </a>
+      {% for kind in kinds %}
+      <a class="facet-chip {{ 'on' if entity_type == kind.value }}"
+         href="/entities?entity_type={{ kind.value | urlencode }}{% if q %}&q={{ q | urlencode }}{% endif %}">
+        {{ kind.value }} <b>{{ kind.count }}</b>
+      </a>
+      {% endfor %}
+    </div>
+  </form>
+
+  <div class="card table">
+    <div class="head cols-ent">
+      <span>{{ t.entName }}</span><span>{{ t.entKind }}</span><span>{{ t.entLinks }}</span>
+    </div>
+    {% for row in rows %}
+    <a class="row cols-ent" href="/entities/{{ row.id }}">
+      <div class="mem-cell">
+        <span class="excerpt">{{ row.data }}</span>
+        {% if row.data_normalized and row.data_normalized != row.data %}
+        <span class="note mono">{{ row.data_normalized }}</span>
+        {% endif %}
+      </div>
+      <span class="cell">{{ row.entity_type or '—' }}</span>
+      <span class="cell strong">{{ row.link_count }}</span>
+    </a>
+    {% else %}
+    <div class="empty">{{ t.entNoMatch }}</div>
+    {% endfor %}
+  </div>
+
+  <p class="note">
+    {% if matched > shown %}{{ t.entTruncated }} {{ shown }} {{ t.ofTotal }} {{ matched }}.{% else %}{{ matched }} {{ t.entMatched }}.{% endif %}
+  </p>
+  {% endif %}
+</div>
+{% endblock %}

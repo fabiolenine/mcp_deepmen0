@@ -243,8 +243,10 @@ class TestUsers:
         assert "open-webui" in html
         assert "Ativo" in html
 
-    def test_unknown_user_goes_back_to_the_dashboard(self, admin):
-        assert admin["client"].get("/users/9999").headers["location"] == "/"
+    def test_unknown_user_goes_back_to_the_user_list(self, admin):
+        # A lista de usuários saiu do painel para /users quando a UI passou a
+        # cobrir também o corpus; o painel virou panorama das duas metades.
+        assert admin["client"].get("/users/9999").headers["location"] == "/users"
 
 
 # ---------------------------------------------------------------- tokens
@@ -435,7 +437,7 @@ class TestInjection:
         admin["client"].post("/users", data={
             "csrf": admin["csrf"], "display_name": payload, "email": "evil@x.com",
         })
-        html = admin["client"].get("/").text
+        html = admin["client"].get("/users").text
         assert payload not in html
         assert "&lt;script&gt;" in html
 

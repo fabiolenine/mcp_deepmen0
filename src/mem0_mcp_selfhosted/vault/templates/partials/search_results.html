@@ -1,0 +1,64 @@
+{% if error %}
+<div class="card accent">
+  <span class="title">{{ t.searchFailed }}</span>
+  <p class="note mono">{{ error }}</p>
+  <p class="note">{{ t.searchFailedHint }}</p>
+</div>
+{% elif ran %}
+
+{% if warnings %}
+<div class="warn-box">
+  <span class="dot"></span>
+  <p>{{ t.searchIgnored }}: {% for w in warnings %}<span class="mono">{{ w }}</span>{% if not loop.last %}, {% endif %}{% endfor %}</p>
+</div>
+{% endif %}
+
+<div class="result-head">
+  <span class="note">{{ envelope.results | length }} {{ t.searchHits }} · {{ elapsed_ms }} ms</span>
+  {% if envelope.event_anchor %}
+  <span class="badge info">{{ t.resEventAnchor }}: {{ envelope.event_anchor.from }} → {{ envelope.event_anchor.to }}</span>
+  {% endif %}
+  {% if envelope.event_filter %}
+  <span class="badge info">{{ t.resEventFilter }}: {{ envelope.event_filter.from }} → {{ envelope.event_filter.to }}</span>
+  {% endif %}
+  {% if envelope.pending_ingest %}
+  <span class="badge warn">{{ t.resPending }}: {{ envelope.pending_ingest }}</span>
+  {% endif %}
+  {% if envelope.historical_recall %}
+  <span class="badge info">{{ t.resHistorical }}</span>
+  {% endif %}
+</div>
+
+{% for r in envelope.results %}
+<a class="card result-card" href="/memories/{{ r.id }}">
+  <div class="result-scores">
+    {% if r.rerank_score is not none %}
+    <span class="score" title="rerank">{{ '%.3f' | format(r.rerank_score) }}</span>
+    <span class="lbl">rerank</span>
+    {% elif r.score is not none %}
+    <span class="score">{{ '%.3f' | format(r.score) }}</span>
+    <span class="lbl">score</span>
+    {% endif %}
+  </div>
+  <div class="result-body">
+    <p class="excerpt">{{ r.text }}</p>
+    <div class="meta">
+      {% if r.superseded_penalty %}<span class="badge warn">{{ t.resPenalty }} {{ r.superseded_penalty }}</span>{% endif %}
+      {% if r.has_newer_version %}<span class="badge warn">{{ t.resNewer }}</span>{% endif %}
+      {% if r.event_proximity %}<span class="badge info">{{ t.resProximity }} {{ '%.2f' | format(r.event_proximity) }}</span>{% endif %}
+      {% if r.event_date %}<span class="badge info">{{ r.event_date }}</span>{% endif %}
+      {% if r.actor_id %}<span class="badge info">{{ t.fldActor }}: {{ r.actor_id }}</span>{% endif %}
+      {% if r.domain %}<span class="chip">{{ r.domain }}</span>{% endif %}
+      {% if r.memory_type %}<span class="chip">{{ r.memory_type }}</span>{% endif %}
+      {% if r.source_doc %}<span class="chip">{{ r.source_doc }}</span>{% endif %}
+      <span class="note">{{ humanize(r.created_at, lang) }}</span>
+    </div>
+  </div>
+</a>
+{% else %}
+<div class="card"><p class="note">{{ t.searchNoHits }}</p></div>
+{% endfor %}
+
+{% else %}
+<div class="card"><p class="note">{{ t.searchIdle }}</p></div>
+{% endif %}

@@ -206,11 +206,28 @@ class TestSearchMemories:
 
 class TestGetMemories:
     def test_scope_filters(self, server_with_mock):
+        """⚠️ Este teste AFIRMAVA `limit=10` — e era o bug.
+
+        `Memory.get_all` é `(*, filters=None, top_k=20, **kwargs)`; o corpo faz
+        `limit = top_k`. Um `limit=` caía no `**kwargs` e SUMIA. MEDIDO no
+        caminho real, contra o core de verdade:
+
+            get_all(limit=100) -> 20 resultados
+            get_all(top_k=100) -> 100 resultados
+
+        O teste passava porque `MagicMock` aceita qualquer kwarg — ele provava
+        que o servidor mandava `limit=`, não que o core o usava. Mock não tem
+        contrato, logo não pode provar contrato.
+
+        A expectativa mudou porque estava codificando o defeito. A guarda que
+        não depende de mock está em `test_actor_filter_and_limit.py`, com um
+        duplo que tem a assinatura real e LEVANTA em kwarg descartado.
+        """
         srv, mem = server_with_mock
         fn = _get_tool_fn(srv, "get_memories")
         fn(user_id="alice", agent_id="agent-1", run_id="run-1", limit=10)
         mem.get_all.assert_called_once_with(
-            user_id="alice", agent_id="agent-1", run_id="run-1", limit=10
+            user_id="alice", agent_id="agent-1", run_id="run-1", top_k=10
         )
 
 

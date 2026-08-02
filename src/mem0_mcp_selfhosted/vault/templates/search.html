@@ -1,0 +1,85 @@
+{% extends "shell.html" %}
+{% block page %}
+<div class="page">
+  <div class="page-head">
+    <div class="titles">
+      <h1>{{ t.navSearch }}</h1>
+      <p>{{ t.searchSub }}</p>
+    </div>
+  </div>
+
+  {% if mcp_error %}
+  <div class="card accent">
+    <span class="title">{{ t.searchUnavailable }}</span>
+    <p class="note mono">{{ mcp_error }}</p>
+  </div>
+  {% endif %}
+
+  <form class="card search-form" hx-get="/search/results" hx-target="#results"
+        hx-indicator="#search-busy" hx-disabled-elt="find button[type=submit]">
+    <div class="search-main">
+      <input type="search" name="query" value="{{ form.get('query', '') }}"
+             placeholder="{{ t.searchPh }}" maxlength="500" autofocus>
+      <button class="btn" type="submit">{{ t.searchRun }}</button>
+    </div>
+
+    <div class="search-grid">
+      <label>
+        <span class="lbl">{{ t.facet_domain }}</span>
+        <input type="text" name="domain" value="{{ form.get('domain', '') }}" maxlength="60">
+      </label>
+      <label>
+        <span class="lbl">{{ t.facet_memory_type }}</span>
+        <input type="text" name="memory_type" value="{{ form.get('memory_type', '') }}" maxlength="40">
+      </label>
+      <label>
+        <span class="lbl">{{ t.facet_attributed_to }}</span>
+        <input type="text" name="attributed_to" value="{{ form.get('attributed_to', '') }}" maxlength="40">
+      </label>
+      <label>
+        <span class="lbl">{{ t.fldActorId }}</span>
+        <input type="text" name="actor_id" value="{{ form.get('actor_id', '') }}" maxlength="80">
+        <span class="hint">{{ t.fldActorHint }}</span>
+      </label>
+      <label>
+        <span class="lbl">{{ t.fldLimit }}</span>
+        <input type="number" name="limit" value="{{ form.get('limit', '10') }}" min="1" max="50">
+      </label>
+      <label>
+        <span class="lbl">{{ t.fldMinImportance }}</span>
+        <input type="number" name="min_importance" value="{{ form.get('min_importance', '') }}"
+               min="0" max="1" step="0.05">
+      </label>
+      <label>
+        <span class="lbl">{{ t.fldAsOf }}</span>
+        <input type="text" name="as_of" value="{{ form.get('as_of', '') }}" placeholder="2026-07-01">
+        <span class="hint">{{ t.fldAsOfHint }}</span>
+      </label>
+      <label>
+        <span class="lbl">{{ t.fldEventFrom }}</span>
+        <input type="text" name="event_from" value="{{ form.get('event_from', '') }}" placeholder="2026-05">
+      </label>
+      <label>
+        <span class="lbl">{{ t.fldEventTo }}</span>
+        <input type="text" name="event_to" value="{{ form.get('event_to', '') }}" placeholder="2026-06">
+      </label>
+    </div>
+
+    <div class="search-foot">
+      <label class="check">
+        <input type="checkbox" name="historical" value="1"
+               {{ 'checked' if form.get('historical') }}>
+        <span>{{ t.fldHistorical }}</span>
+      </label>
+      <span class="note">{{ t.fldHistoricalHint }}</span>
+      <span class="grow"></span>
+      <span id="search-busy" class="htmx-indicator busy">
+        <span class="spinner"></span>{{ t.searchBusy }}
+      </span>
+    </div>
+    <p class="note">{{ t.searchSlowNote }}</p>
+  </form>
+
+  <div id="results"></div>
+</div>
+{% endblock %}

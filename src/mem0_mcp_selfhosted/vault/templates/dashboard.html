@@ -6,31 +6,33 @@
       <h1>{{ t.navDash }}</h1>
       <p>{{ t.dashSub }}</p>
     </div>
-    <a class="btn" href="/?new=1">+ {{ t.newUser }}</a>
   </div>
 
+  <span class="section-label">{{ t.dashCorpus }}</span>
   <div class="stats">
-    <div class="stat">
-      <span class="lbl">{{ t.statUsers }}</span>
+    <a class="stat link" href="/memories">
+      <span class="lbl">{{ t.statMemories }}</span>
       <div class="row">
-        <span class="val">{{ stats.users_active }}</span>
-        <span class="sub">{{ t.ofTotal }} {{ stats.users_total }}</span>
+        <span class="val">{{ corpus.memories if corpus.memories is not none else '—' }}</span>
+        <span class="sub">{{ t.memUnit }}</span>
       </div>
-    </div>
-    <div class="stat">
-      <span class="lbl">{{ t.statTokens }}</span>
+    </a>
+    <a class="stat link" href="/entities">
+      <span class="lbl">{{ t.statEntities }}</span>
       <div class="row">
-        <span class="val">{{ stats.tokens_active }}</span>
-        <span class="sub">{{ t.ofTotal }} {{ stats.tokens_total }}</span>
+        <span class="val">{{ corpus.entities if corpus.entities is not none else '—' }}</span>
+        <span class="sub">{{ t.entUnit }}</span>
       </div>
-    </div>
-    <div class="stat">
-      <span class="lbl">{{ t.statUsed24h }}</span>
+    </a>
+    <a class="stat link" href="/queue">
+      <span class="lbl">{{ t.queueDepth }}</span>
       <div class="row">
-        <span class="val">{{ seen_24h }}</span>
-        <span class="sub">{{ t.ofTotal }} {{ stats.tokens_active }}</span>
+        <span class="val">{{ corpus.queue_depth if corpus.queue_depth is not none else '—' }}</span>
+        <span class="sub">
+          {% if corpus.queue_dead %}{{ corpus.queue_dead }} {{ t.queueDead | lower }}{% else %}{{ t.queueActive }}{% endif %}
+        </span>
       </div>
-    </div>
+    </a>
     <div class="stat">
       <span class="lbl">{{ t.mcpLabel }}</span>
       <div class="row">
@@ -40,6 +42,41 @@
         </span>
       </div>
     </div>
+  </div>
+  {% if corpus.error %}
+  <p class="note mono">{{ t.srcUnavailable }}: {{ corpus.error }}</p>
+  {% endif %}
+
+  <span class="section-label">{{ t.dashCredentials }}</span>
+  <div class="stats">
+    <a class="stat link" href="/users">
+      <span class="lbl">{{ t.statUsers }}</span>
+      <div class="row">
+        <span class="val">{{ stats.users_active }}</span>
+        <span class="sub">{{ t.ofTotal }} {{ stats.users_total }}</span>
+      </div>
+    </a>
+    <a class="stat link" href="/users">
+      <span class="lbl">{{ t.statTokens }}</span>
+      <div class="row">
+        <span class="val">{{ stats.tokens_active }}</span>
+        <span class="sub">{{ t.ofTotal }} {{ stats.tokens_total }}</span>
+      </div>
+    </a>
+    <div class="stat">
+      <span class="lbl">{{ t.statUsed24h }}</span>
+      <div class="row">
+        <span class="val">{{ seen_24h }}</span>
+        <span class="sub">{{ t.ofTotal }} {{ stats.tokens_active }}</span>
+      </div>
+    </div>
+    <a class="stat link" href="/audit">
+      <span class="lbl">{{ t.navAudit }}</span>
+      <div class="row">
+        <span class="val">→</span>
+        <span class="sub">{{ t.dashAuditSub }}</span>
+      </div>
+    </a>
   </div>
 
   {% if auth_mode != 'on' %}
@@ -76,53 +113,10 @@
   </div>
   {% endif %}
 
-  {% if new_user_open %}
-  <form class="card accent" method="post" action="/users">
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <span class="title">{{ t.newUser }}</span>
-    <div class="inline-form">
-      <input type="text" name="display_name" placeholder="{{ t.nuNamePh }}" maxlength="200" required>
-      <input class="wide" type="email" name="email" placeholder="{{ t.nuEmailPh }}" maxlength="254" required>
-      <button class="btn" type="submit">{{ t.create }}</button>
-    </div>
-    {% if error %}
-    <p class="form-error"><span class="dot"></span>{{ error }}</p>
-    {% endif %}
-    <p class="note">{{ t.nuNote }}</p>
-  </form>
+  {% if observe_url %}
+  <p class="note">
+    {{ t.dashObserve }} <a href="{{ observe_url }}" rel="noreferrer">{{ observe_url }}</a>
+  </p>
   {% endif %}
-
-  <div class="card table">
-    <div class="head cols-users">
-      <span>{{ t.colUser }}</span><span>{{ t.colTokens }}</span>
-      <span>{{ t.colStatus }}</span><span>{{ t.colLast }}</span>
-    </div>
-    {% for u in users %}
-    {% set hue = avatar_hue(u.email) %}
-    <a class="row cols-users" href="/users/{{ u.id }}">
-      <div class="who-cell">
-        <div class="avatar {{ 'off' if u.disabled_at }}"
-             style="background:oklch(0.92 0.04 {{ hue }});color:oklch(0.4 0.13 {{ hue }})">
-          {{ initials(u.display_name or u.email) }}
-        </div>
-        <div class="txt">
-          <span class="n">{{ u.display_name or u.email }}</span>
-          <span class="e">{{ u.email }}</span>
-        </div>
-      </div>
-      <span class="cell strong">
-        {{ u.active_tokens }}{% if u.inactive_tokens %} (+{{ u.inactive_tokens }}){% endif %}
-      </span>
-      {% if u.disabled_at %}
-      <span class="badge danger">{{ t.disabled }}</span>
-      {% else %}
-      <span class="badge ok">{{ t.active }}</span>
-      {% endif %}
-      <span class="cell">{{ humanize(u.last_used_at, lang) }}</span>
-    </a>
-    {% else %}
-    <div class="empty">{{ t.noUsers }}</div>
-    {% endfor %}
-  </div>
 </div>
 {% endblock %}
